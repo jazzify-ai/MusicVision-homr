@@ -19,12 +19,15 @@ musicxml = "1.4"
 rapidocr = "^3.7.0"
 onnxruntime="^1.24.1"
 requests="^2.32.5"
+fastapi = "^0.124.0"
+uvicorn = {extras = ["standard"], version = "^0.38.0"}
 
 [tool.poetry.group.gpu.dependencies]
 onnxruntime-gpu = "^1.24.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
+httpx = "^0.28.0"
 mypy = "^1.19.1"
 black = "^26.1.0"
 ruff = "^0.15.1"

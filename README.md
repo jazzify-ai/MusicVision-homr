@@ -1,5 +1,8 @@
 # homr
 
+This split is the AGPL-covered HOMR component for Jazzify/MusicVision. It can
+run as a standalone HTTP service and exposes source information at `/source`.
+
 homr is an Optical Music Recognition (OMR) software designed to transform camera pictures of sheet music into
 machine-readable MusicXML format. The resulting [MusicXML](https://www.w3.org/2021/06/musicxml40/) files can be further
 processed using tools such as [musescore](https://musescore.com/).
@@ -24,6 +27,40 @@ You might also want to check out [Andromr](https://github.com/aicelen/Andromr), 
 - Run the program using `poetry run homr <image>`
 - The resulting MusicXML file will be saved in the same directory as the input image
 - To combine the MusicXML results from multiple images, you can use [relieur](https://github.com/papoteur-mga/relieur)
+
+## HOMR HTTP service
+
+The service wrapper lives in `homr_service/` and exposes:
+
+- `GET /health`
+- `GET /source`
+- `POST /v1/omr`
+- `POST /v1/geometry`
+
+Requests pass shared filesystem paths, not image bytes:
+
+```json
+{
+  "job_id": "job-1",
+  "input_image_path": "/shared/jobs/job-1/input/preprocessed.png",
+  "output_dir": "/shared/jobs/job-1/output",
+  "mode": "full"
+}
+```
+
+Run locally:
+
+```powershell
+poetry install
+$env:HOMR_SHARED_JOBS_ROOT = "C:\path\to\shared\jobs"
+poetry run uvicorn homr_service.main:app --host 127.0.0.1 --port 8010
+```
+
+Build the service image:
+
+```powershell
+docker build -t jazzify-homr-agpl .
+```
 
 ## Example
 

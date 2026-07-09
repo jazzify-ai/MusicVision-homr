@@ -1,62 +1,43 @@
-# Run e.g. with docker build -t homr . && docker run --rm -p 8080:8000 homr
-# And then send images: curl -X POST -F "file=@tabi.jpg" http://localhost:8080/process --output tabi.musicxml
-
 FROM python:3.11
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUTF8=1 \
+    PYTHONUNBUFFERED=1 \
+    HOMR_PORT=8010 \
+    HOMR_SHARED_JOBS_ROOT=/shared/jobs \
+    HOMR_PRELOAD_MODELS=true \
+    POETRY_DYNAMIC_VERSIONING_BYPASS=0.1.0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN apt update && apt install -y libgl1
+RUN pip install --no-cache-dir --upgrade pip
 
-RUN curl -sSL https://install.python-poetry.org | python3 -
+COPY pyproject.toml README.md LICENSE MODIFICATIONS.md ./
+COPY homr ./homr
+COPY homr_service ./homr_service
 
-RUN git clone https://github.com/liebharc/homr .
+RUN pip install --no-cache-dir .
 
-RUN /root/.local/bin/poetry install --without dev
+RUN python -m homr.main --init
 
-RUN /root/.local/bin/poetry run pip install --no-cache-dir fastapi uvicorn python-multipart
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /shared/jobs /models \
+    && chown -R appuser:appuser /app /shared /models
 
-# Pre-download models
-RUN /root/.local/bin/poetry run python homr/main.py --init
+USER appuser
 
-# Generate FastAPI app inline
-RUN cat <<'EOF' > api.py
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-from fastapi.responses import FileResponse
-import subprocess
-import tempfile
-import os
-import shutil
+EXPOSE 8010
 
-app = FastAPI()
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=5 \
+    CMD curl -fsS "http://127.0.0.1:${HOMR_PORT}/health" || exit 1
 
-@app.post("/process")
-def process_image(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-):
-    tmpdir = tempfile.mkdtemp()
-
-    input_path = os.path.join(tmpdir, file.filename)
-    with open(input_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    subprocess.check_call([
-        "python", "homr/main.py", input_path
-    ])
-
-    base, _ = os.path.splitext(input_path)
-    output_path = base + ".musicxml"
-
-    background_tasks.add_task(shutil.rmtree, tmpdir)
-
-    return FileResponse(
-        output_path,
-        media_type="application/xml",
-        filename=os.path.basename(output_path),
-    )
-EOF
-
-EXPOSE 8000
-
-CMD ["/root/.local/bin/poetry", "run", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
-
+CMD ["sh", "-c", "uvicorn homr_service.main:app --host 0.0.0.0 --port ${HOMR_PORT}"]
