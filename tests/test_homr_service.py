@@ -1,3 +1,6 @@
+import io
+import json
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -21,82 +24,67 @@ def test_health_and_source(monkeypatch) -> None:
     }
 
 
-def test_rejects_path_traversal(tmp_path: Path, monkeypatch) -> None:
-    shared_root = tmp_path / "shared" / "jobs"
-    shared_root.mkdir(parents=True)
-    outside = tmp_path / "outside.png"
-    outside.write_bytes(b"fake")
+def test_old_shared_path_endpoints_are_not_exposed(monkeypatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
-    monkeypatch.setenv("HOMR_SHARED_JOBS_ROOT", str(shared_root))
 
     with TestClient(service.app) as client:
-        response = client.post(
-            "/v1/omr",
-            json={
-                "job_id": "job-1",
-                "input_image_path": str(outside),
-                "output_dir": str(shared_root / "job-1" / "output"),
-                "mode": "full",
-            },
-        )
+        full_response = client.post("/v1/omr", json={})
+        geometry_response = client.post("/v1/geometry", json={})
 
-    assert response.status_code == 400
-    assert "path must resolve under" in response.json()["detail"]["error"]
+    assert full_response.status_code == 404
+    assert geometry_response.status_code == 404
 
 
-def test_full_mode_success_with_mocked_homr(tmp_path: Path, monkeypatch) -> None:
-    shared_root, input_path, output_dir = _job_paths(tmp_path)
+def test_full_upload_success_with_mocked_homr(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
-    monkeypatch.setenv("HOMR_SHARED_JOBS_ROOT", str(shared_root))
     monkeypatch.setattr(service, "_run_homr", _fake_run_homr)
 
     with TestClient(service.app) as client:
         response = client.post(
-            "/v1/omr",
-            json={
-                "job_id": "job-1",
-                "input_image_path": str(input_path),
-                "output_dir": str(output_dir),
-                "mode": "full",
-            },
+            "/v1/omr/upload",
+            data={"job_id": "job-1", "mode": "full"},
+            files={"file": ("preprocessed.png", b"fake-image", "image/png")},
         )
 
-    payload = response.json()
     assert response.status_code == 200
-    assert payload["mode"] == "full"
-    assert payload["artifacts"]["musicxml_path"] == str((output_dir / "score.musicxml").resolve())
-    assert payload["artifacts"]["geometry_json_path"] == str((output_dir / "geometry.json").resolve())
-    assert payload["source_url"].endswith("Jazzify-homr-agpl")
+    assert response.headers["content-type"] == "application/zip"
+    entries = _zip_entries(response.content)
+    assert entries["score.musicxml"] == b"<score-partwise/>"
+    assert entries["geometry.json"] == b"{}"
+    assert entries["homr_processed.png"] == b"fake"
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    assert manifest["mode"] == "full"
+    assert manifest["artifacts"] == {
+        "musicxml_path": "score.musicxml",
+        "geometry_json_path": "geometry.json",
+        "processed_image_path": "homr_processed.png",
+    }
+    assert manifest["source_url"].endswith("Jazzify-homr-agpl")
 
 
-def test_geometry_mode_success_with_mocked_homr(tmp_path: Path, monkeypatch) -> None:
-    shared_root, input_path, output_dir = _job_paths(tmp_path)
+def test_geometry_upload_success_with_mocked_homr(monkeypatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
-    monkeypatch.setenv("HOMR_SHARED_JOBS_ROOT", str(shared_root))
     monkeypatch.setattr(service, "_run_homr", _fake_run_homr)
 
     with TestClient(service.app) as client:
         response = client.post(
-            "/v1/geometry",
-            json={
-                "job_id": "job-1",
-                "input_image_path": str(input_path),
-                "output_dir": str(output_dir),
-                "mode": "geometry",
-            },
+            "/v1/geometry/upload",
+            data={"job_id": "job-1", "mode": "geometry"},
+            files={"file": ("preprocessed.png", b"fake-image", "image/png")},
         )
 
-    payload = response.json()
     assert response.status_code == 200
-    assert payload["mode"] == "geometry"
-    assert payload["artifacts"]["musicxml_path"] is None
-    assert not (output_dir / "score.musicxml").exists()
+    entries = _zip_entries(response.content)
+    assert "score.musicxml" not in entries
+    assert entries["geometry.json"] == b"{}"
+    assert entries["homr_processed.png"] == b"fake"
+    manifest = json.loads(entries["manifest.json"].decode("utf-8"))
+    assert manifest["mode"] == "geometry"
+    assert manifest["artifacts"]["musicxml_path"] is None
 
 
-def test_homr_failure_returns_structured_error(tmp_path: Path, monkeypatch) -> None:
-    shared_root, input_path, output_dir = _job_paths(tmp_path)
+def test_homr_failure_returns_structured_error(monkeypatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
-    monkeypatch.setenv("HOMR_SHARED_JOBS_ROOT", str(shared_root))
 
     def fail_homr(*, input_path: Path, output_dir: Path, geometry_only: bool) -> None:
         raise RuntimeError("model failure")
@@ -105,13 +93,9 @@ def test_homr_failure_returns_structured_error(tmp_path: Path, monkeypatch) -> N
 
     with TestClient(service.app) as client:
         response = client.post(
-            "/v1/omr",
-            json={
-                "job_id": "job-1",
-                "input_image_path": str(input_path),
-                "output_dir": str(output_dir),
-                "mode": "full",
-            },
+            "/v1/omr/upload",
+            data={"job_id": "job-1", "mode": "full"},
+            files={"file": ("preprocessed.png", b"fake-image", "image/png")},
         )
 
     assert response.status_code == 500
@@ -121,19 +105,15 @@ def test_homr_failure_returns_structured_error(tmp_path: Path, monkeypatch) -> N
     }
 
 
-def _job_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
-    shared_root = tmp_path / "shared" / "jobs"
-    input_dir = shared_root / "job-1" / "input"
-    output_dir = shared_root / "job-1" / "output"
-    input_dir.mkdir(parents=True)
-    output_dir.mkdir(parents=True)
-    input_path = input_dir / "preprocessed.png"
-    input_path.write_bytes(b"fake-image")
-    return shared_root, input_path, output_dir
-
-
 def _fake_run_homr(*, input_path: Path, output_dir: Path, geometry_only: bool) -> None:
+    assert input_path.name == "input.png"
+    assert input_path.read_bytes() == b"fake-image"
     (output_dir / "geometry.json").write_text("{}", encoding="utf-8")
     (output_dir / "homr_processed.png").write_bytes(b"fake")
     if not geometry_only:
         (output_dir / "score.musicxml").write_text("<score-partwise/>", encoding="utf-8")
+
+
+def _zip_entries(content: bytes) -> dict[str, bytes]:
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        return {name: archive.read(name) for name in archive.namelist()}

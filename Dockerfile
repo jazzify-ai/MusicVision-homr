@@ -4,7 +4,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUTF8=1 \
     PYTHONUNBUFFERED=1 \
     HOMR_PORT=8010 \
-    HOMR_SHARED_JOBS_ROOT=/shared/jobs \
     HOMR_PRELOAD_MODELS=true \
     POETRY_DYNAMIC_VERSIONING_BYPASS=0.1.0
 
@@ -30,8 +29,8 @@ RUN pip install --no-cache-dir .
 RUN python -m homr.main --init
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
-    && mkdir -p /shared/jobs /models \
-    && chown -R appuser:appuser /app /shared /models
+    && mkdir -p /models \
+    && chown -R appuser:appuser /app /models
 
 USER appuser
 

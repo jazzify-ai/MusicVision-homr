@@ -18,7 +18,6 @@ Run locally:
 ```powershell
 python -m pip install poetry
 poetry install
-$env:HOMR_SHARED_JOBS_ROOT = "C:\path\to\shared\jobs"
 poetry run uvicorn homr_service.main:app --host 127.0.0.1 --port 8010
 ```
 

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
+import tempfile
 import time
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
 import onnxruntime as ort
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel
 
 from homr.main import (
     GpuSupport,
@@ -35,23 +39,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Jazzify HOMR AGPL Service", version="0.1.0", lifespan=lifespan)
 
 
-class OmrRequest(BaseModel):
-    job_id: str = Field(min_length=1, max_length=128)
-    input_image_path: str
-    output_dir: str
-    mode: Literal["full", "geometry"] = "full"
-
-
 class ArtifactPaths(BaseModel):
     musicxml_path: str | None
     geometry_json_path: str
     processed_image_path: str
 
 
-class OmrResponse(BaseModel):
+class ArtifactManifest(BaseModel):
     job_id: str
     mode: Literal["full", "geometry"]
-    artifacts: ArtifactPaths
+    artifacts: dict[str, str | None]
     timings_ms: dict[str, int]
     source_url: str
 
@@ -81,48 +78,79 @@ def source() -> dict[str, str]:
     }
 
 
-@app.post("/v1/omr", response_model=OmrResponse)
-def run_full_omr(request: OmrRequest) -> OmrResponse:
-    return _process_homr_request(request, geometry_only=False)
+@app.post("/v1/omr/upload")
+def run_full_omr_upload(
+    job_id: str = Form(..., min_length=1, max_length=128),
+    mode: Literal["full"] = Form("full"),
+    file: UploadFile = File(...),
+) -> Response:
+    del mode
+    return _process_uploaded_homr_request(job_id=job_id, file=file, geometry_only=False)
 
 
-@app.post("/v1/geometry", response_model=OmrResponse)
-def run_geometry(request: OmrRequest) -> OmrResponse:
-    return _process_homr_request(request, geometry_only=True)
+@app.post("/v1/geometry/upload")
+def run_geometry_upload(
+    job_id: str = Form(..., min_length=1, max_length=128),
+    mode: Literal["geometry"] = Form("geometry"),
+    file: UploadFile = File(...),
+) -> Response:
+    del mode
+    return _process_uploaded_homr_request(job_id=job_id, file=file, geometry_only=True)
 
 
-def _process_homr_request(request: OmrRequest, *, geometry_only: bool) -> OmrResponse:
-    if geometry_only and request.mode != "geometry":
-        raise HTTPException(status_code=400, detail={"error": "mode must be geometry"})
-    if not geometry_only and request.mode != "full":
-        raise HTTPException(status_code=400, detail={"error": "mode must be full"})
-
-    input_path = _resolve_under_shared_jobs(request.input_image_path)
-    output_dir = _resolve_under_shared_jobs(request.output_dir)
-    if not input_path.is_file():
-        raise HTTPException(status_code=400, detail={"error": f"input image not found: {input_path}"})
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _process_uploaded_homr_request(
+    *,
+    job_id: str,
+    file: UploadFile,
+    geometry_only: bool,
+) -> Response:
+    suffix = Path(file.filename or "preprocessed.png").suffix.lower() or ".png"
     started = time.perf_counter()
     try:
-        _run_homr(input_path=input_path, output_dir=output_dir, geometry_only=geometry_only)
+        with tempfile.TemporaryDirectory(prefix=f"homr-{job_id}-") as temp_dir:
+            work_dir = Path(temp_dir)
+            input_path = work_dir / f"input{suffix}"
+            output_dir = work_dir / "output"
+            output_dir.mkdir()
+            _write_upload_to_path(file, input_path)
+            _run_homr(input_path=input_path, output_dir=output_dir, geometry_only=geometry_only)
+
+            artifacts = _artifact_paths(output_dir, geometry_only=geometry_only)
+            _validate_artifacts(artifacts, geometry_only=geometry_only)
+            total_ms = int((time.perf_counter() - started) * 1000)
+            manifest = ArtifactManifest(
+                job_id=job_id,
+                mode="geometry" if geometry_only else "full",
+                artifacts={
+                    "musicxml_path": "score.musicxml" if not geometry_only else None,
+                    "geometry_json_path": "geometry.json",
+                    "processed_image_path": "homr_processed.png",
+                },
+                timings_ms={"total": total_ms},
+                source_url=_source_url(),
+            )
+            zip_bytes = _build_artifact_zip(
+                output_dir=output_dir,
+                manifest=manifest,
+                geometry_only=geometry_only,
+            )
     except InvalidProgramArgumentException as exc:
         raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail={"error": "HOMR processing failed", "message": str(exc)},
         ) from exc
 
-    artifacts = _artifact_paths(output_dir, geometry_only=geometry_only)
-    _validate_artifacts(artifacts, geometry_only=geometry_only)
-    total_ms = int((time.perf_counter() - started) * 1000)
-    return OmrResponse(
-        job_id=request.job_id,
-        mode="geometry" if geometry_only else "full",
-        artifacts=artifacts,
-        timings_ms={"total": total_ms},
-        source_url=_source_url(),
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{job_id}-homr-artifacts.zip"',
+            "X-HOMR-Source-URL": _source_url(),
+        },
     )
 
 
@@ -157,6 +185,33 @@ def _run_homr(*, input_path: Path, output_dir: Path, geometry_only: bool) -> Non
             shutil.move(str(generated_musicxml_path), musicxml_path)
 
 
+def _write_upload_to_path(file: UploadFile, input_path: Path) -> None:
+    with input_path.open("wb") as output_file:
+        shutil.copyfileobj(file.file, output_file)
+
+
+def _build_artifact_zip(
+    *,
+    output_dir: Path,
+    manifest: ArtifactManifest,
+    geometry_only: bool,
+) -> bytes:
+    zip_path = output_dir / "homr_artifacts.zip"
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("manifest.json", json.dumps(_model_to_dict(manifest), indent=2))
+        if not geometry_only:
+            archive.write(output_dir / "score.musicxml", "score.musicxml")
+        archive.write(output_dir / "geometry.json", "geometry.json")
+        archive.write(output_dir / "homr_processed.png", "homr_processed.png")
+    return zip_path.read_bytes()
+
+
+def _model_to_dict(model: BaseModel) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
 def _artifact_paths(output_dir: Path, *, geometry_only: bool) -> ArtifactPaths:
     return ArtifactPaths(
         musicxml_path=None if geometry_only else str((output_dir / "score.musicxml").resolve()),
@@ -178,23 +233,6 @@ def _validate_artifacts(artifacts: ArtifactPaths, *, geometry_only: bool) -> Non
             status_code=500,
             detail={"error": "HOMR did not produce expected artifacts", "missing": missing},
         )
-
-
-def _resolve_under_shared_jobs(raw_path: str) -> Path:
-    shared_root = _shared_jobs_root()
-    path = Path(raw_path).expanduser().resolve()
-    try:
-        path.relative_to(shared_root)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": f"path must resolve under {shared_root}: {raw_path}"},
-        ) from exc
-    return path
-
-
-def _shared_jobs_root() -> Path:
-    return Path(os.getenv("HOMR_SHARED_JOBS_ROOT", "/shared/jobs")).expanduser().resolve()
 
 
 def _source_url() -> str:

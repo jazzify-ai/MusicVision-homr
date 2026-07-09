@@ -34,25 +34,23 @@ The service wrapper lives in `homr_service/` and exposes:
 
 - `GET /health`
 - `GET /source`
-- `POST /v1/omr`
-- `POST /v1/geometry`
+- `POST /v1/omr/upload`
+- `POST /v1/geometry/upload`
 
-Requests pass shared filesystem paths, not image bytes:
+Requests upload a preprocessed image and receive a ZIP of ordinary artifacts:
 
-```json
-{
-  "job_id": "job-1",
-  "input_image_path": "/shared/jobs/job-1/input/preprocessed.png",
-  "output_dir": "/shared/jobs/job-1/output",
-  "mode": "full"
-}
+```powershell
+curl -X POST `
+  -F "job_id=job-1" `
+  -F "mode=full" `
+  -F "file=@preprocessed.png" `
+  http://127.0.0.1:8010/v1/omr/upload --output homr-artifacts.zip
 ```
 
 Run locally:
 
 ```powershell
 poetry install
-$env:HOMR_SHARED_JOBS_ROOT = "C:\path\to\shared\jobs"
 poetry run uvicorn homr_service.main:app --host 127.0.0.1 --port 8010
 ```
 
