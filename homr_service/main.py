@@ -165,11 +165,7 @@ def _run_homr(*, input_path: Path, output_dir: Path, geometry_only: bool) -> Non
         selected_staff=-1,
         use_gpu_inference=_use_gpu_inference(),
     )
-    xml_generator_args = XmlGeneratorArguments(
-        output_large_page=False,
-        output_metronome=None,
-        output_tempo=None,
-    )
+    xml_generator_args = XmlGeneratorArguments(False, None, None)
     process_image(
         str(input_path),
         config,
