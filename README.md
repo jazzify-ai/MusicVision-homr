@@ -57,7 +57,7 @@ poetry run uvicorn homr_service.main:app --host 127.0.0.1 --port 8010
 Build the service image:
 
 ```powershell
-docker build -t jazzify-homr-agpl .
+docker build -t jazzify-musicvision-homr .
 ```
 
 ## Example

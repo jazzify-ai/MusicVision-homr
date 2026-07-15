@@ -26,7 +26,7 @@ from homr.main import (
 from homr.music_xml_generator import XmlGeneratorArguments
 from homr.title_detection import download_ocr_weights
 
-DEFAULT_SOURCE_URL = "https://github.com/Jazzify/Jazzify-MusicVision-homr-agpl"
+DEFAULT_SOURCE_URL = "https://github.com/Jazzify/Jazzify-MusicVision-homr"
 
 
 @asynccontextmanager
