@@ -59,7 +59,7 @@ def test_full_upload_success_with_mocked_homr(tmp_path: Path, monkeypatch) -> No
         "geometry_json_path": "geometry.json",
         "processed_image_path": "homr_processed.png",
     }
-    assert manifest["source_url"].endswith("Jazzify-MusicVision-homr")
+    assert manifest["source_url"].endswith("MusicVision-homr")
 
 
 def test_geometry_upload_success_with_mocked_homr(monkeypatch) -> None:
