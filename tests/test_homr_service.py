@@ -37,7 +37,8 @@ def test_old_shared_path_endpoints_are_not_exposed(monkeypatch: MonkeyPatch) -> 
 
 
 def test_full_upload_success_with_mocked_homr(
-    tmp_path: Path, monkeypatch: MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
     monkeypatch.setattr(service, "_run_homr", _fake_run_homr)
