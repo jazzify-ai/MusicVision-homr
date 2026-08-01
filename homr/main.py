@@ -472,12 +472,18 @@ def main() -> None:
     parser.add_argument(
         "--processed-image",
         type=str,
-        help="Optional path where the exact processed image used for geometry detection should be written.",
+        help=(
+            "Optional path where the exact processed image used for geometry "
+            "detection should be written."
+        ),
     )
     parser.add_argument(
         "--geometry-only",
         action="store_true",
-        help="Run visual staff and measure detection, write requested geometry artifacts, and skip MusicXML generation.",
+        help=(
+            "Run visual staff and measure detection, write requested geometry "
+            "artifacts, and skip MusicXML generation."
+        ),
     )
     parser.add_argument(
         "--gpu",
