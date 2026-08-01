@@ -60,6 +60,13 @@ Build the service image:
 docker build -t jazzify-musicvision-homr .
 ```
 
+The container image is published to GitHub Container Registry by
+`.github/workflows/container-ghcr.yml`:
+
+```text
+ghcr.io/jazzify-ai/musicvision-homr
+```
+
 ## Example
 
 The example below provides an overview of the current performance of the implementation. While some errors are present

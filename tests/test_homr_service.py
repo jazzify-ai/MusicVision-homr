@@ -4,11 +4,12 @@ import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from pytest import MonkeyPatch
 
 import homr_service.main as service
 
 
-def test_health_and_source(monkeypatch) -> None:
+def test_health_and_source(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
     monkeypatch.setenv("HOMR_SOURCE_URL", "https://example.test/homr")
 
@@ -24,7 +25,7 @@ def test_health_and_source(monkeypatch) -> None:
     }
 
 
-def test_old_shared_path_endpoints_are_not_exposed(monkeypatch) -> None:
+def test_old_shared_path_endpoints_are_not_exposed(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
 
     with TestClient(service.app) as client:
@@ -35,7 +36,10 @@ def test_old_shared_path_endpoints_are_not_exposed(monkeypatch) -> None:
     assert geometry_response.status_code == 404
 
 
-def test_full_upload_success_with_mocked_homr(tmp_path: Path, monkeypatch) -> None:
+def test_full_upload_success_with_mocked_homr(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
     monkeypatch.setattr(service, "_run_homr", _fake_run_homr)
 
@@ -62,7 +66,7 @@ def test_full_upload_success_with_mocked_homr(tmp_path: Path, monkeypatch) -> No
     assert manifest["source_url"].endswith("MusicVision-homr")
 
 
-def test_geometry_upload_success_with_mocked_homr(monkeypatch) -> None:
+def test_geometry_upload_success_with_mocked_homr(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
     monkeypatch.setattr(service, "_run_homr", _fake_run_homr)
 
@@ -83,7 +87,7 @@ def test_geometry_upload_success_with_mocked_homr(monkeypatch) -> None:
     assert manifest["artifacts"]["musicxml_path"] is None
 
 
-def test_homr_failure_returns_structured_error(monkeypatch) -> None:
+def test_homr_failure_returns_structured_error(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setenv("HOMR_PRELOAD_MODELS", "false")
 
     def fail_homr(*, input_path: Path, output_dir: Path, geometry_only: bool) -> None:
