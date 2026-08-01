@@ -185,6 +185,7 @@ def process_image(
     eprint("Processing " + image_path)
     xml_file = replace_extension(image_path, ".musicxml")
     debug_cleanup: Debug | None = None
+    title_future: Future[str] | None
     try:
         if config.read_staff_positions:
             image = cv2.imread(image_path)
@@ -196,7 +197,7 @@ def process_image(
             multi_staffs = load_staff_positions(
                 debug, image, staff_position_files, config.selected_staff
             )
-            title_future: Future[str] = Future()
+            title_future = Future()
             title_future.set_result("")
             bar_line_boxes: list[RotatedBoundingBox] = []
         else:
