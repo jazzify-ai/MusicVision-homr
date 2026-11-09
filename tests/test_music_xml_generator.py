@@ -154,28 +154,6 @@ XMLStaff(value: 2),
 XMLNotations()])])])])"""
         self.assertEqual(self._norm_expected(expected), actual)
 
-    def test_strip_articulations(self) -> None:
-        chord = SymbolChord(
-            [
-                EncodedSymbol("note_8", articulation="staccatissimo"),
-                EncodedSymbol("note_16", articulation="tieStart_slurStop_tenuto"),
-                EncodedSymbol("note_32", articulation="tieStart"),
-            ]
-        )
-
-        articulations, result = chord.strip_slur_ties()
-        self.assertEqual(
-            result.symbols,
-            (
-                [
-                    EncodedSymbol("note_8", articulation="staccatissimo"),
-                    EncodedSymbol("note_16", articulation="tenuto"),
-                    EncodedSymbol("note_32", articulation="_"),
-                ]
-            ),
-        )
-        self.assertEqual(articulations, ["slurStop", "tieStart"])
-
     def test_begin_chord_with_standalone_rests(self) -> None:
         """
         If the lower position consists of a standalone rest then start the

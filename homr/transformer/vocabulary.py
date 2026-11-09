@@ -616,16 +616,17 @@ def _remove_tuplets(measure: list[list[EncodedSymbol]]) -> list[list[EncodedSymb
 
 def _fix_over_eager_tuplets(chords: list[list[EncodedSymbol]]) -> list[list[EncodedSymbol]]:
     """
-    The transformer tends to add too many tuplets, so we remove them
-    based on the length of a measurement.
+    Repair a short measure only when unscaling its tuplets exactly restores
+    the typical measure duration. A short pickup alone is not sufficient evidence.
     """
     measures = _group_into_measures(chords)
     mean = _get_typical_duration_of_measures(measures)
     result = []
     for i, measure in enumerate(measures):
-        if _get_duration_of_measure(measure) < mean:
+        unscaled = _remove_tuplets(measure)
+        if _get_duration_of_measure(measure) < mean and _get_duration_of_measure(unscaled) == mean:
             eprint("Removing tuplets from measure #", i + 1)
-            result.append(_remove_tuplets(measure))
+            result.append(unscaled)
         else:
             result.append(measure)
     return _flatten_measures(result)

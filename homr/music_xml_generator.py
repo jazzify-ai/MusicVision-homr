@@ -8,7 +8,13 @@ import numpy as np
 
 from homr import constants
 from homr.simple_logging import eprint
-from homr.transformer.vocabulary import EncodedSymbol, empty, nonote, sort_token_chords
+from homr.transformer.vocabulary import (
+    EncodedSymbol,
+    SymbolDuration,
+    empty,
+    nonote,
+    sort_token_chords,
+)
 
 
 class ConversionState:
@@ -40,9 +46,13 @@ class ConversionState:
 
 
 class SymbolChord:
-    def __init__(self, symbols: list[EncodedSymbol], tuplet_mark: str = "") -> None:
+    def __init__(
+        self,
+        symbols: list[EncodedSymbol],
+        tuplet_marks: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
         self.symbols = symbols
-        self.tuplet_mark = tuplet_mark
+        self.tuplet_marks = tuplet_marks if tuplet_marks is not None else {}
 
     def __str__(self) -> str:
         return str.join("&", [str(s) for s in self.symbols])
@@ -75,26 +85,12 @@ class SymbolChord:
                 lower.append(symbol)
                 lower_is_only_rest = lower_is_only_rest and symbol.rhythm.startswith("rest")
         chords = (
-            SymbolChord(upper, self.tuplet_mark),
-            SymbolChord(lower, self.tuplet_mark),
+            SymbolChord(upper, self.tuplet_marks),
+            SymbolChord(lower, self.tuplet_marks),
         )
         if lower_is_only_rest:
             chords = (chords[1], chords[0])
         return [chord for chord in chords if len(chord.symbols) > 0]
-
-    def strip_slur_ties(self) -> tuple[list[str], "SymbolChord"]:
-        slurs_ties = set()
-
-        result = []
-        for symbol in self.symbols:
-            stripped, result_symbol = symbol.strip_articulations(
-                ["slurStart", "slurStop", "tieStart", "tieStop"]
-            )
-            result.append(result_symbol)
-            for articulation in stripped:
-                slurs_ties.add(articulation)
-
-        return sorted(slurs_ties), SymbolChord(result, tuplet_mark=self.tuplet_mark)
 
 
 class XmlGeneratorArguments:
@@ -512,8 +508,13 @@ DURATION_NAMES = {
 }
 
 
+def _tie_types(articulations: str) -> list[str]:
+    markers = set(articulations.split("_"))
+    return [kind for kind in ("stop", "start") if "tie" + kind.capitalize() in markers]
+
+
 def build_articulations(
-    note: mxl.XMLNote, articualations: str, tuplet_mark: str, state: ConversionState
+    note: mxl.XMLNote, articualations: str, tuplet_marks: tuple[str, ...], state: ConversionState
 ) -> None:
     notation = mxl.XMLNotations()
     note.add_child(notation)
@@ -558,16 +559,17 @@ def build_articulations(
             notation.add_child(mxl.XMLSlur(type="start"))
         elif articulation == "slurStop":
             notation.add_child(mxl.XMLSlur(type="stop"))
-        elif articulation == "tieStart":
-            notation.add_child(mxl.XMLTied(type="start"))
-        elif articulation == "tieStop":
-            notation.add_child(mxl.XMLTied(type="stop"))
+        elif articulation in ("tieStart", "tieStop"):
+            # A continuation ends the preceding tie before starting the next.
+            continue
         else:
             raise ValueError("Unsupported articulation " + articulation)
 
-    if tuplet_mark != "":
-        tuplet_xml = mxl.XMLTuplet(type=tuplet_mark)
-        notation.add_child(tuplet_xml)
+    for tie_type in _tie_types(articualations):
+        notation.add_child(mxl.XMLTied(type=tie_type))
+
+    for tuplet_mark in tuplet_marks:
+        notation.add_child(mxl.XMLTuplet(type=tuplet_mark))
 
     if len(xml_articulations) > 0:
         parent = mxl.XMLArticulations()
@@ -587,7 +589,7 @@ def build_note_or_rest(
     rhythmic_layer: int,
     is_chord: bool,
     state: ConversionState,
-    tuplet_mark: str,
+    tuplet_marks: tuple[str, ...],
 ) -> mxl.XMLNote:
     note = mxl.XMLNote()
     if is_chord:
@@ -627,6 +629,9 @@ def build_note_or_rest(
         note.add_child(mxl.XMLType(value_=duration_name))
         note.add_child(mxl.XMLDuration(value_=state.beats))
 
+    for tie_type in _tie_types(model_note.articulation):
+        note.add_child(mxl.XMLTie(type=tie_type))
+
     staff_num = get_staff(model_note)
     note.add_child(mxl.XMLStaff(value_=staff_num))
     note.add_child(mxl.XMLVoice(value_=str(get_xml_voice(staff_num, rhythmic_layer))))
@@ -637,9 +642,9 @@ def build_note_or_rest(
         time_modification.add_child(mxl.XMLActualNotes(value_=model_duration.actual_notes))
         time_modification.add_child(mxl.XMLNormalNotes(value_=model_duration.normal_notes))
         note.add_child(time_modification)
-        build_articulations(note, model_note.articulation, tuplet_mark, state)
+        build_articulations(note, model_note.articulation, tuplet_marks, state)
     else:
-        build_articulations(note, model_note.articulation, "", state)
+        build_articulations(note, model_note.articulation, (), state)
 
     return note
 
@@ -661,7 +666,6 @@ def build_multi_measure_rest(
 def build_note_chord(
     note_chord: SymbolChord, state: ConversionState, chord_duration: Fraction
 ) -> list[mxl.XMLElement]:
-    _slurs_ties, note_chord = note_chord.strip_slur_ties()
     by_duration = _group_notes(note_chord.symbols)
     result: list[mxl.XMLElement] = []
     final_duration = Fraction(0)
@@ -670,7 +674,8 @@ def build_note_chord(
         is_first = True
         for note_loop in by_duration[group_duration]:
             note = note_loop
-            result.append(build_note_or_rest(note, i, not is_first, state, note_chord.tuplet_mark))
+            marks = note_chord.tuplet_marks.get(note.position, ()) if is_first else ()
+            result.append(build_note_or_rest(note, i, not is_first, state, marks))
             is_first = False
         if i != len(sorted_durations) - 1 and group_duration > Fraction(0):
             backup = mxl.XMLBackup()
@@ -773,22 +778,52 @@ def group_into_chords(voice: list[EncodedSymbol]) -> list[SymbolChord]:
     return [SymbolChord(s) for s in sort_token_chords(voice)]
 
 
+def _mark_tuplet_run(position: str, run: list[tuple[SymbolChord, SymbolDuration]]) -> None:
+    if not run:
+        return
+    # The sequence has durations but no explicit bracket boundaries. Infer simple
+    # groups from the smallest written value in this uninterrupted, same-ratio run.
+    unit = min(
+        duration.fraction * Fraction(duration.actual_notes, duration.normal_notes)
+        for _, duration in run
+    )
+    group_duration = unit * run[0][1].normal_notes
+    elapsed = Fraction(0)
+    for index, (group, duration) in enumerate(run):
+        marks: tuple[str, ...] = ("start",) if elapsed == 0 else ()
+        elapsed += duration.fraction
+        if elapsed >= group_duration or index == len(run) - 1:
+            marks += ("stop",)
+            elapsed = Fraction(0)
+        group.tuplet_marks[position] = marks
+
+
 def add_tuplet_start_stop(groups: list[SymbolChord]) -> list[SymbolChord]:
-    has_tuplet_mark = False
+    runs: dict[str, list[tuple[SymbolChord, SymbolDuration]]] = defaultdict(list)
     for group in groups:
-        is_tuplet = False
+        group.tuplet_marks = {}
+        if group.is_barline():
+            for position, run in runs.items():
+                _mark_tuplet_run(position, run)
+            runs.clear()
+            continue
+        by_position: dict[str, list[SymbolDuration]] = defaultdict(list)
         for symbol in group.symbols:
             if symbol.rhythm.startswith(("note", "rest")):
                 duration = symbol.get_duration()
-                is_tuplet = is_tuplet or duration.normal_notes != duration.actual_notes
-
-        if is_tuplet != has_tuplet_mark:
-            if has_tuplet_mark:
-                group.tuplet_mark = "stop"
-            else:
-                group.tuplet_mark = "start"
-            has_tuplet_mark = is_tuplet
-
+                if duration.fraction > 0:
+                    by_position[symbol.position].append(duration)
+        for position, durations in by_position.items():
+            duration = min(durations, key=lambda d: d.fraction)
+            run = runs[position]
+            ratio = (duration.actual_notes, duration.normal_notes)
+            if run and ratio != (run[-1][1].actual_notes, run[-1][1].normal_notes):
+                _mark_tuplet_run(position, run)
+                run = runs[position] = []
+            if duration.actual_notes != duration.normal_notes:
+                run.append((group, duration))
+    for position, run in runs.items():
+        _mark_tuplet_run(position, run)
     return groups
 
 

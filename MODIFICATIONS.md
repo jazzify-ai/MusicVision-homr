@@ -12,6 +12,9 @@ High-level changes in this split:
 - Geometry-only execution mode for staff/barline detection without MusicXML generation.
 - FastAPI service wrapper in `homr_service/` exposing HOMR over an HTTP/file-artifact API.
 - Container build that runs the HOMR service as a standalone AGPL component.
+- Preservation of predicted tie/slur articulations and simple tuplet boundaries
+  during MusicXML export; conservative short-measure tuplet cleanup. See
+  `docs/rhythm_preservation.md` for scope, limitations, and regression coverage.
 
 Run locally:
 
