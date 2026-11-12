@@ -9,12 +9,6 @@ def test_bar_penalty_is_proportional_to_the_difference() -> None:
     assert bar_penalty(Fraction(4), None, 3.0) == 0.0
 
 
-def test_first_bar_may_be_a_short_pickup_but_not_too_long() -> None:
-    assert bar_penalty(Fraction(1), Fraction(4), 3.0, may_be_pickup=True) == 0.0
-    # A misread triplet makes the bar longer; that is still penalised on the first bar.
-    assert bar_penalty(Fraction(9, 2), Fraction(4), 3.0, may_be_pickup=True) == 1.5
-
-
 def test_reference_needs_a_clear_majority_of_plain_bars() -> None:
     four = [(Fraction(4), False)] * 3
     assert reference_bar_length([*four, (Fraction(3), False)]) == 4

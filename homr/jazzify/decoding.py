@@ -192,17 +192,14 @@ def reference_bar_length(bars: Iterable[tuple[Fraction, bool]]) -> Fraction | No
     return None
 
 
-def bar_penalty(
-    length: Fraction, reference: Fraction | None, weight: float, *, may_be_pickup: bool = False
-) -> float:
+def bar_penalty(length: Fraction, reference: Fraction | None, weight: float) -> float:
     """Soft penalty (in log-probability units) for a closed bar of ``length`` quarters.
 
-    ``may_be_pickup``: the page's first bar may be an anacrusis, which is always shorter than a
-    full bar, so only a too-long first bar is penalised (a misread triplet makes a bar longer).
+    Every bar is held to the page reference, including the first: lead sheets in the
+    evaluation sets write pickups as full bars padded with rests, and exempting short first
+    bars (tried 2026-11-12) only let the beam drop rests on continuation pages.
     """
     if reference is None or weight <= 0:
-        return 0.0
-    if may_be_pickup and length < reference:
         return 0.0
     return weight * float(abs(length - reference))
 
@@ -696,15 +693,7 @@ def _make_generate(options: DecodeOptions, page: _PageState, evidence: dict):
                         )
                         continue
                     closed = bar.add(emitted, position)
-                    # The page's first bar: first staff of this pass, no barline read yet.
-                    first_bar_of_page = len(page.staffs) == 1 and not any(
-                        sym.rhythm in BAR_CLOSERS for sym in hyp.symbols
-                    )
-                    penalty = (
-                        bar_penalty(closed, reference, weight, may_be_pickup=first_bar_of_page)
-                        if closed is not None
-                        else 0
-                    )
+                    penalty = bar_penalty(closed, reference, weight) if closed is not None else 0
                     if reinterpret_meter and emitted == name and name.startswith("timeSignature/"):
                         if page.meter_seen or any(
                             s.rhythm.startswith(("note_", "rest_")) for s in hyp.symbols
