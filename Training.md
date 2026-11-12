@@ -17,13 +17,16 @@ Prerequisites:
 - Linux
 - CUDA
 - rsvg-convert, e.g. via `sudo apt install librsvg2-bin`
+- libfuse, e.g. via `sudo apt install libfuse2t64` on Ubuntu24 or `sudo apt install libfuse2` on Ubuntu22/20
+- libjack, e.g. via `sudo apt install libjack-jackd2-0`
 
 Download the datasets and convert them to the format required for training:
 
-- `training/datasets/convert_primus.py`
-- `training/datasets/convert_grandstaff.py`
-- `training/datasets/convert_lieder.py`  
-  This will also download and run MuseScore as an AppImage. If this fails, check your setup to ensure that you can run `datasets/MuseScore`.
+- `training/omr_datasets/convert_primus.py`
+- `training/omr_datasets/convert_grandstaff.py`
+- `training/omr_datasets/convert_lieder.py`
+  - This will also download and run MuseScore as an AppImage. If this fails, check your setup to ensure that you can run `datasets/MuseScore`.
+  - Not all files are supported. At the end you'll see something like `Processed 1460/1467 files, skipped 350 files`, which is as expected.
 
 Some checks:
 
@@ -32,7 +35,26 @@ Some checks:
 - `training/validate_music_xml_conversion.py`: Visualize datasets; takes one of `datasets/*/index.txt` as an argument
 
 Finally, start the training itself with: `training/train.py transformer`.  
+You can check the log and see number of training files to be 190k: `Total number of training files to choose from 190722`
 This takes around 2–4 days.
+
+Batch size for FP16 - don't forget to also modify gradient_accumulation_steps:
+
+- 8GB VRAM: 8
+- 16GB VRAM: 18 (default)
+- 24GB VRAM: 32
+
+Distributed Training:
+
+- Distributed training supports single-machine, multi-GPU setups. Using 4 GPUs as an example, run: `CUDA_VISIBLE_DEVICES=0,1,2,3 poetry run torchrun --standalone --nnodes=1 --nproc_per_node=4 training/train.py transformer`
+- Dataset generation and model loading/saving are handled by rank0.
+- It is recommended to use 2 or 4 GPUs to keep training consistent with single-GPU training. For other GPU counts, you need to manually adjust the `gradient_accumulation_steps` parameter. Multi-node, multi-GPU training is theoretically supported, but has not been tested in practice.
+
+Cloud Training:
+
+- Homr can be trained on community clouds like vast.ai since the dataset is opensource and only 12GB big (can be uploaded to google drive for free)
+- As homr only uses bf16 training and doesn't use newer features like FP8, the RTX 3090 seems to provide the best value
+- Homr's data loading requires a good CPU: try to get something similar to an i5-11400
 
 ## Results
 
@@ -55,7 +77,215 @@ This validation provides a **more representative indication of overall system pe
 
 Implementation: `rate_validation_result.py`
 
-## Run 334
+# Run 520 - Epoch 14 - discarded
+Commit: c0a84a090eb2afb7282d1272df0e661aad42a7fc
+Day: 7 November
+System Level: ?
+Polish scores: 17.4%
+SMB scores: ?
+
+Experiment: Using text-only pretraining for the decoder. Stopped training because eval_accuracy was worse than previous runs. The code can be found here https://github.com/aicelen/homr/tree/exp/pretraining
+
+
+# Run 509
+
+Commit: 2293bba14bfea47d9d28411339362af15fce4c31
+Day: 26 October 2026
+System Level: 6.1 diffs, SER: 4.4% | 14.1 diffs, SER: 8.1% with the reference fixed | 13.7 diffs, SER: 7.7% after staff detection and multirest fixes | 7.7 diffs, SER: 4.4% after MusicXML fixes
+Polish scores: 15.33% | 15.32% after staff detection and multirest fixes | 15.18% after MusicXML fixes
+SMB scores: 13.31% with staff detection improvements but without triplet restoration | 13.08% after staff detection and multirest fixes | 13.09% after MusicXML fixes
+
+Adding dynamcis (PR 174), strong accents (PR 191) and minor fix to multirests (PR 195)
+
+MusicXML fixes with the same model: a note no longer starts before the previous note of its voice has ended, tuplets keep their tuplet marks and a second voice on a staff is written as voice 2 with stems down. On Polish 15 pages get better and 6 worse. On those 6 the model reads groups of three in 6/8 or 9/16 as triplets. Before the fix the MusicXML lacked the tuplet marks for these notes, so the benchmark read them as plain notes and didn't count the error. SMB shows the same effect: 38 pages get better because real tuplets keep their marks, 66 get worse because tuplets the model predicts where the score has plain 16th or 8th notes are now visible to the benchmark.
+
+# Run 480
+
+Commit: 5eed84636c96eca5ce6d8e2f62580b74e7ed85e8
+Day: 11 October 2026
+Transformer Smoke Test: 6%
+System Level: 5.4 diffs, SER: 3.7% | 5.0 diffs, SER: 3.5% with triplet restoration | 14.7 diffs, SER: 8.2% with the reference fixed
+Polish scores: 16.41% | 16.46% after staff detection improvements | 15.41% with triplet restoration
+SMB scores: 12.71% | 12.46% after staff detection improvements | 12.75% with triplet restoration
+
+Tuplets whose number isn't printed are labelled as tuplets, and staff lines with many tuplets are kept in the training data. For more details see PR 181.
+Triplet restoration puts back triplets which are printed without their number after the transformer, see PR 194.
+
+# Run 465
+
+Commit: 597144cab54c8f6d0f6c9619df5c5312694eadd6
+Day: 26 September 2026
+Transformer Smoke Test: 5%
+System Level: Total: 5.1 diffs, SER: 4.0% | 4.7 diffs, SER: 3.4% after staff detection improvements
+Polish scores: 17.52% | 17.70% after staff detection improvements
+SMB scores: 13.84% | 13.60% after staff detection improvements
+
+Parse multiple voices per staff. For more details see PR 156.
+
+# Run 455
+
+Commit: 7bf1389908b44047d4cba9d5d06e868ceaf946ef
+Day: 16 September 2026
+Transformer Smoke Test: 5%
+System Level: Total: ?
+Polish scores: 17.8%
+SMB scores: ?
+
+Using lieder pipeline for pdmx dataset. For more details see PR 162.
+
+# Run 455 - discarded PR 153
+
+Commit: 7bf1389908b44047d4cba9d5d06e868ceaf946ef
+Day: 9 September 2026
+Transformer Smoke Test: 5%
+System Level: ?
+Polish scores: 17.9%
+SMB scores: ?
+
+Filtering images from pdmx dataset with low resolution due to wrong aspect ratio.
+
+## Run 426 - 27 epochs
+
+Commit: b6fd20809a8dcaf10dfd39a4ca4f64c6f056e644
+Day: 13 July 2026
+Transformer Smoke Test: 5%
+System Level: Total: 5.7 diffs, SER: 4.2% | 5.1 diffs, SER: 4.0% after PR-112
+Polish scores: OMR-NED 24.30% | 18.1% after PR-112
+SMB scores: OMR-NED 22.06% | 14.5% after PR-112
+
+Training with lieder+grandstaff+primux+pdmx+musetrainer datasets.
+
+Note that PR-110 and PR-112 improved the scoring results independent from the model itself.
+
+## Run 414
+
+Commit: 79aec9b6b66de2281972c9d4f9c606f3f84c9cd1
+Day: 7 July 2026
+Transformer Smoke Test: 6%
+System Level: Total: 5.9 diffs, SER: 4.9%
+
+Clean the Lieder dataset to introduce more training data
+
+## Run 407 - at epoch 6
+
+Commit: fabab4b0f8480be20d13686edf5f91d913ab00fd
+Day: 26 June 2026
+Transformer Smoke Test: 17%
+System Level: 9.3 diffs, SER: 7.4%
+Polish scores with musicdiff: OMR-NED 46.4%
+
+Quick training run after updates to the dataset conversions. Results look okay for only 6 epochs.
+
+## Run 396
+
+Commit: f6feedb42ff90087d898b0941a55d040fa6b2903
+Day: 12 June 2026
+Transformer Smoke Test: 7%
+System Level: Total: 6.7 diffs, SER: 5.2%
+
+Final training run for #86 (https://github.com/liebharc/homr/pull/86), up to date with all changes on main branch
+
+## Run 396 - discarded at epoch 9
+
+Commit: f6feedb42ff90087d898b0941a55d040fa6b2903
+Day: 11 June 2026
+Transformer Smoke Test: -
+
+Reintroduced tie vocabulary and stopped adding all slurs&ties on the first note of a chord. The model performed significantly worse on slurs&ties than the runs before. This run was part of #86 (https://github.com/liebharc/homr/pull/86), code can be found (https://github.com/aicelen/homr/tree/feature/improve-slurs-ties).
+
+## Run 396 - discarded at epoch 10
+
+Commit: f6feedb42ff90087d898b0941a55d040fa6b2903
+Day: 9 June 2026
+Transformer Smoke Test: SER avg: 11%
+
+Removed problematic files from grandstaff containing more slurStart than slurStop (https://github.com/liebharc/homr/pull/86)
+
+## Run 396 - discarded at epoch 12
+
+Commit: f6feedb42ff90087d898b0941a55d040fa6b2903
+Day: 30 May 2026
+Transformer Smoke Test: SER avg: 9%
+
+Split articulations&slurs into two branches.
+This resulted in the model being too eager to predict slurStart (https://github.com/liebharc/homr/pull/86)
+
+## Run 384 - discarded
+
+Commit: 0fee4303aeb8bb21a10fd0d7b457485a6d22fa0d
+Day: 5 Jun 2026
+Transformer Smoke Test: SER avg: 6%
+System Level: 6.4 diffs, SER: 5.2%
+
+Fusing 1&2
+
+## Run 385 - discarded
+
+Commit: 620d4591bcd716b722c894bc5546dc8f5d5e3a1c
+Day: 5 Jun 2026
+Transformer Smoke Test: SER avg: 7%
+System Level: 6.5 diffs, SER: 4.9%
+
+Fusing 1&2&3
+
+## Run 386 - discarded
+
+Commit: c1c0e3b126f2e2971c565197ce10bd752ad02687
+Day: 5 Jun 2026
+Transformer Smoke Test: SER avg: 6%
+System Level: 8.4 diffs, SER: 5.5%
+
+Fusing 2&3
+
+## Run 381 - discarded
+
+Commit: 6ced21726443ed037608f8610ff4e7dac445649a
+Day: 1 Jun 2026
+Transformer Smoke Test: SER 6%
+System Level: 5.6 diffs, SER: 3.1%
+
+FPN Style fusion, https://github.com/liebharc/homr/pull/85 . The run is on good as e.g. #367 and #331, but the model is more complex and a manual review of the results indicate a less robust pitch detection.
+
+A possible way forward would be to not mix fused features, but instead concat stage 2 and stage 3. That however
+increases the encoder_dim and decoder_dim from 512 to 1152 (768 + 384) which makes training and inference much more expensive.
+
+## Run 367
+
+Commit: 575b4737bca815d3a7b37169269fc548d7e945b9, which after a rebase is 0b865c41e56a1e58bf531ada27ad80ea1f5ab716
+Day: 29 May 2026  
+Transformer Smoke Test: SER 6%
+System Level: 5.6 diffs, SER: 4.7%
+
+Fixed an error in the accuracy calculation during training: https://github.com/liebharc/homr/pull/84
+
+## Run 366
+
+Commit: ac68c5e38711de6abaa6064eaf2773aa49352d01
+Day: 29 May 2026  
+Transformer Smoke Test: SER 6%
+System Level: 5.8 diffs, SER: 4.7%
+
+Using a newer MuseScore version for the Lieder dataset: https://github.com/liebharc/homr/pull/75
+
+## Run 368 - discarded
+
+Commit: aad3b0899cee5b931aae3dd4345d371a8634669c
+Day: 24 May 2026  
+Transformer Smoke Test: SER 5%
+System Level: 12.3 diffs, SER: 16.2%
+
+Agnostic data format, with less complexity when it comes to pitch and accidentals.
+
+## Run 367 - discarded
+
+Commit: 39ff998262112d75b425cdd99c43ab61441a3f4e
+Day: 22 May 2026  
+Transformer Smoke Test: SER 7%
+System Level: 7.0 diffs, SER: 5.2%
+
+Updated MuseScore version used to convert the Lieder dataset and switched to sinusoidal positional embedding.
+
+## Run 334 - discarded
 
 Commit: 6d996c3d118c1e183f8412832383168e52630ce8
 Day: 17 Feb 2026  
@@ -64,7 +294,7 @@ System Level: 10.2 diffs, SER: 13.6%
 
 convnextv2_base, https://github.com/liebharc/homr/pull/59
 
-## Run 333
+## Run 333 - discarded
 
 Commit: bb0ced2ff0cacdbd8ee33db4533a04c9e77f0ca8
 Day: 17 Feb 2026  

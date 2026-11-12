@@ -1,9 +1,12 @@
+# flake8: noqa: S101
+
 import math
+import xml.etree.ElementTree as ET
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 
-import musicxml.xmlelement.xmlelement as mxl
 import numpy as np
 
 from homr import constants
@@ -12,6 +15,7 @@ from homr.transformer.vocabulary import (
     EncodedSymbol,
     SymbolDuration,
     empty,
+    is_lower_position,
     nonote,
     sort_token_chords,
 )
@@ -47,12 +51,14 @@ class ConversionState:
 
 class SymbolChord:
     def __init__(
-        self,
-        symbols: list[EncodedSymbol],
-        tuplet_marks: dict[str, tuple[str, ...]] | None = None,
+        self, symbols: list[EncodedSymbol], tuplet_marks: dict[str, str] | None = None
     ) -> None:
         self.symbols = symbols
-        self.tuplet_marks = tuplet_marks if tuplet_marks is not None else {}
+        # Tuplet start or stop by position (e.g. upper2), voices have their own tuplets
+        self.tuplet_marks: dict[str, str] = tuplet_marks if tuplet_marks is not None else {}
+
+    def mark_for(self, symbol: EncodedSymbol) -> str:
+        return self.tuplet_marks.get(symbol.position, "")
 
     def __str__(self) -> str:
         return str.join("&", [str(s) for s in self.symbols])
@@ -75,22 +81,15 @@ class SymbolChord:
         return min(notes_rests)
 
     def into_positions(self) -> list["SymbolChord"]:
-        upper = []
-        lower = []
-        lower_is_only_rest = True
+        buckets: dict[str, list[EncodedSymbol]] = defaultdict(list)
         for symbol in self.symbols:
-            if symbol.position == "upper":
-                upper.append(symbol)
-            else:
-                lower.append(symbol)
-                lower_is_only_rest = lower_is_only_rest and symbol.rhythm.startswith("rest")
-        chords = (
-            SymbolChord(upper, self.tuplet_marks),
-            SymbolChord(lower, self.tuplet_marks),
+            buckets[symbol.position].append(symbol)
+        chords = [SymbolChord(symbols, self.tuplet_marks) for symbols in buckets.values()]
+        # Voices of only rests go first, the last chord is the one which advances time.
+        chords.sort(
+            key=lambda chord: all(s.rhythm.startswith("rest") for s in chord.symbols), reverse=True
         )
-        if lower_is_only_rest:
-            chords = (chords[1], chords[0])
-        return [chord for chord in chords if len(chord.symbols) > 0]
+        return chords
 
 
 class XmlGeneratorArguments:
@@ -102,42 +101,46 @@ class XmlGeneratorArguments:
         self.tempo = tempo
 
 
-def build_identification() -> mxl.XMLIdentification:
-    """Identification/encoding so validators and apps (e.g. MuseScore) can attribute the file."""
-    ident = mxl.XMLIdentification()
-    enc = mxl.XMLEncoding()
-    enc.add_child(mxl.XMLSoftware(value_="homr"))
-    ident.add_child(enc)
+def build_identification() -> ET.Element:
+    ident = ET.Element("identification")
+    enc = ET.SubElement(ident, "encoding")
+    ET.SubElement(enc, "software").text = "homr"
     return ident
 
 
 def generate_xml(
     args: XmlGeneratorArguments, staffs: list[list[EncodedSymbol]], title: str
-) -> mxl.XMLElement:
-    root = mxl.XMLScorePartwise(version="4.0")
-    root.add_child(build_work(title))
-    root.add_child(build_identification())
-    root.add_child(build_defaults(args))
+) -> ET.Element:
+    root = ET.Element("score-partwise", version="4.0")
+    root.append(build_work(title))
+    root.append(build_identification())
+    root.append(build_defaults(args))
     has_two_staves_by_part = [_voice_has_two_staves(staff) for staff in staffs]
-    root.add_child(build_part_list(has_two_staves_by_part))
+    root.append(build_part_list(has_two_staves_by_part))
     for index, staff in enumerate(staffs):
-        root.add_child(build_part(args, staff, index, has_two_staves_by_part[index]))
+        root.append(build_part(args, staff, index, has_two_staves_by_part[index]))
     return root
+
+
+def xml_to_string(element: ET.Element) -> str:
+    return ET.tostring(element, encoding="unicode")
 
 
 def _voice_has_two_staves(voice: list[EncodedSymbol]) -> bool:
     """True if any symbol uses the lower staff (e.g. piano left hand / bass clef)."""
-    return any(s.position == "lower" for s in voice)
+    return any(is_lower_position(s.position) for s in voice)
 
 
 def build_part(
     args: XmlGeneratorArguments, voice: list[EncodedSymbol], index: int, has_two_staves: bool
-) -> mxl.XMLPart:
-    part = mxl.XMLPart(id=get_part_id(index))
+) -> ET.Element:
+    part = ET.Element("part", id=get_part_id(index))
     is_first_part = index == 0
-    measures = build_measures(args, voice, is_first_part, has_two_staves)
-    for measure in measures:
-        part.add_child(measure)
+    for measure in build_measures(args, voice, is_first_part, has_two_staves):
+        part.append(measure)
+    convert_ties(part)
+    add_stems(part)
+    _remove_position_attributes(part)
     return part
 
 
@@ -146,27 +149,50 @@ def build_measures(
     voice: list[EncodedSymbol],
     is_first_part: bool,
     has_two_staves: bool = False,
-) -> list[mxl.XMLMeasure]:
+) -> list[ET.Element]:
+    clock = GroupClock()
+    measure_number = 1
+    # Measures a multi-measure rest still covers after the current one
+    rest_measures = 0
+
+    def measure_rests(measure: ET.Element) -> None:
+        positions = ["upper", "lower"] if has_two_staves else ["upper"]
+        for staff_no, position in enumerate(positions):
+            if staff_no > 0:
+                measure.append(build_backup(state.nominator, state))
+            measure.append(
+                build_measure_rest(EncodedSymbol("measureRest", position=position), state)
+            )
+
     def close_current_measure() -> None:
+        nonlocal clock, measure_number, rest_measures
         rebalance_measure_voices(current_measure)
         measures.append(current_measure)
+        clock = GroupClock()
+        # MusicXML writes a multi-measure rest as that many measures
+        for _ in range(rest_measures):
+            measure_number += 1
+            measure = ET.Element("measure", number=str(measure_number))
+            measure_rests(measure)
+            measures.append(measure)
+        rest_measures = 0
 
-    measure_number = 1
-    groups = add_tuplet_start_stop(group_into_chords(voice))
-    division, nominator = find_division_and_time_signature_nominator(groups)
-    state = ConversionState(division, nominator)
-    measures: list[mxl.XMLMeasure] = []
-    current_measure = mxl.XMLMeasure(number=str(measure_number))
+    groups = split_mixed_chords(add_tuplet_start_stop(group_into_chords(voice)))
+    division, nominators = find_division_and_time_signature_nominators(groups)
+    state = ConversionState(division, nominators[0])
+    time_signature_no = 0
+    measures: list[ET.Element] = []
+    current_measure = ET.Element("measure", number=str(measure_number))
     first_attributes = build_or_get_attributes(current_measure, None)
-    first_attributes.add_child(build_divisions(division))
+    ET.SubElement(first_attributes, "divisions").text = str(division // 4)
     if has_two_staves:
-        first_attributes.add_child(mxl.XMLStaves(value_=2))
-        first_attributes.add_child(mxl.XMLPartSymbol(value_="brace"))
+        ET.SubElement(first_attributes, "staves").text = "2"
+        ET.SubElement(first_attributes, "part-symbol").text = "brace"
     if is_first_part:
         direction = build_add_time_direction(args)
-        if direction:
-            current_measure.add_child(direction)
-    attributes: mxl.XMLAttributes | None = first_attributes
+        if direction is not None:
+            current_measure.append(direction)
+    attributes: ET.Element | None = first_attributes
     for group_no, group in enumerate(groups):
         symbol = group.symbols[0]
         rhythm = symbol.rhythm
@@ -175,20 +201,30 @@ def build_measures(
         if rhythm.startswith(("note", "rest")):
             if len(group.symbols) == 1 and rhythm.endswith("m"):
                 attributes = build_or_get_attributes(current_measure, last_attributes)
-                build_multi_measure_rest(symbol, attributes)
+                duration = build_multi_measure_rest(symbol, attributes)
+                if duration > 0:
+                    measure_rests(current_measure)
+                    rest_measures = duration - 1
             else:
                 staff_positions = group.into_positions()
+                gap = clock.wait_for_voices(group)
+                if gap > 0:
+                    current_measure.append(build_forward(gap, state))
+                advance = clock.advance(group)
                 for pos_no, staff_pos in enumerate(staff_positions):
-                    chord_duration = (
-                        group.get_duration() if pos_no == len(staff_positions) - 1 else Fraction(0)
-                    )
+                    chord_duration = advance if pos_no == len(staff_positions) - 1 else Fraction(0)
                     for note_xml in build_note_chord(staff_pos, state, chord_duration):
-                        current_measure.add_child(note_xml)
+                        current_measure.append(note_xml)
             continue
-        if rhythm == "newline":
+        if rhythm == "measureRest":
+            for staff_no, rest in enumerate(sorted(group.symbols, key=get_staff)):
+                if staff_no > 0:
+                    current_measure.append(build_backup(state.nominator, state))
+                current_measure.append(build_measure_rest(rest, state))
+        elif rhythm == "newline":
             is_last_measure = group_no == len(groups) - 1
             if not is_last_measure:
-                current_measure.add_child(mxl.XMLPrint(new_system="yes"))
+                ET.SubElement(current_measure, "print", attrib={"new-system": "yes"})
         elif rhythm.startswith("clef"):
             attributes = build_or_get_attributes(current_measure, last_attributes, force_new=True)
             for should_be_clef in group.symbols:
@@ -199,20 +235,21 @@ def build_measures(
             build_key(symbol, attributes)
         elif rhythm.startswith("timeSignature"):
             attributes = build_or_get_attributes(current_measure, last_attributes)
+            state.nominator = nominators[min(time_signature_no, len(nominators) - 1)]
+            time_signature_no += 1
             build_time_signature(symbol, attributes, state)
         elif "barline" in rhythm:
             if rhythm != "barline":
-                # Standard barlines don't need extra handling
                 barline = build_or_get_barline(current_measure, "right")
                 build_barline_style(symbol, barline)
 
             close_current_measure()
             measure_number += 1
-            current_measure = mxl.XMLMeasure(number=str(measure_number))
+            current_measure = ET.Element("measure", number=str(measure_number))
         elif rhythm == "repeatStart":
             close_current_measure()
             measure_number += 1
-            current_measure = mxl.XMLMeasure(number=str(measure_number))
+            current_measure = ET.Element("measure", number=str(measure_number))
 
             barline = build_or_get_barline(current_measure, "right")
             build_repeat(symbol, barline)
@@ -222,14 +259,14 @@ def build_measures(
 
             close_current_measure()
             measure_number += 1
-            current_measure = mxl.XMLMeasure(number=str(measure_number))
+            current_measure = ET.Element("measure", number=str(measure_number))
         elif rhythm == "repeatEndStart":
             barline = build_or_get_barline(current_measure, "right")
             build_repeat(EncodedSymbol("repeatEnd"), barline)
 
             close_current_measure()
             measure_number += 1
-            current_measure = mxl.XMLMeasure(number=str(measure_number))
+            current_measure = ET.Element("measure", number=str(measure_number))
             barline = build_or_get_barline(current_measure, "right")
             build_repeat(EncodedSymbol("repeatStart"), barline)
         elif rhythm.startswith("voltaStart"):
@@ -240,38 +277,98 @@ def build_measures(
             volta_number = state.stop_volta(measure_number)
             barline = build_or_get_barline(current_measure, "right")
             build_barline_ending(symbol, barline, volta_number)
+
+        elif rhythm.startswith("dynamic") or symbol.articulation.startswith("dynamic"):
+            for dynamic in group.symbols:
+                build_dynamic(dynamic, current_measure)
         else:
             eprint("Symbol isn't supported yet ", symbol)
 
-    if len(current_measure.get_children()) > 0:
+    if len(list(current_measure)) > 0:
         close_current_measure()
+    # A clef opens a second attributes element, so look at the whole first measure
+    if measures[0].find("attributes/time") is None:
+        time_el = ET.SubElement(first_attributes, "time")
+        beats = max(int(state.nominator * 4), 1)
+        ET.SubElement(time_el, "beats").text = str(beats)
+        ET.SubElement(time_el, "beat-type").text = "4"
     return measures
 
 
-def build_work(title_text: str) -> mxl.XMLWork:
-    work = mxl.XMLWork()
-    title = mxl.XMLWorkTitle()
-    title._value = title_text
-    work.add_child(title)
+class GroupClock:
+    """
+    When the groups of a measure start. Tokens say which notes start together, not
+    when each group starts. A group starts when the earliest still-sounding note ends
+    (that is how training data is grouped), but not before the earlier notes of its
+    own positions (voices) have ended.
+    """
+
+    def __init__(self) -> None:
+        self.time = Fraction(0)
+        self.sounding: list[Fraction] = []
+        self.voice_free: dict[str, Fraction] = {}
+
+    @staticmethod
+    def _timed(group: SymbolChord) -> list[EncodedSymbol]:
+        # Grace notes have no duration and take no time
+        return [
+            s
+            for s in group.symbols
+            if s.rhythm.startswith(("note", "rest")) and s.get_duration().fraction > 0
+        ]
+
+    def wait_for_voices(self, group: SymbolChord) -> Fraction:
+        """Moves the time to when the positions of the group are free, returns the gap."""
+        free = max(
+            (self.voice_free.get(s.position, Fraction(0)) for s in self._timed(group)),
+            default=Fraction(0),
+        )
+        gap = max(free - self.time, Fraction(0))
+        self.time += gap
+        self.sounding = [end for end in self.sounding if end > self.time]
+        return gap
+
+    def advance(self, group: SymbolChord) -> Fraction:
+        """Moves the time to the start of the next group and returns how far."""
+        # A position can hold notes of different lengths, the shortest one frees it
+        shortest: dict[str, Fraction] = {}
+        for symbol in self._timed(group):
+            duration = symbol.get_duration().fraction
+            shortest[symbol.position] = min(duration, shortest.get(symbol.position, duration))
+        for position, duration in shortest.items():
+            self.voice_free[position] = self.time + duration
+        advance = _advance_to_next_group(group, self.time, self.sounding)
+        self.time += advance
+        self.sounding = [end for end in self.sounding if end > self.time]
+        return advance
+
+
+def _advance_to_next_group(
+    group: SymbolChord, clock: Fraction, sounding: list[Fraction]
+) -> Fraction:
+    """How far the next group starts after this one, updating the sounding notes in place."""
+    durations = [
+        s.get_duration().fraction for s in group.symbols if s.rhythm.startswith(("note", "rest"))
+    ]
+    timed = [d for d in durations if d > 0]  # grace notes have no duration and take no time
+    if not timed:
+        return Fraction(0)
+    sounding.extend(clock + d for d in timed)
+    return min(end for end in sounding if end > clock) - clock
+
+
+def build_work(title_text: str) -> ET.Element:
+    work = ET.Element("work")
+    ET.SubElement(work, "work-title").text = title_text
     return work
 
 
-def build_defaults(args: XmlGeneratorArguments) -> mxl.XMLDefaults:
-    if not args.large_page:
-        return mxl.XMLDefaults()
-    # These values are larger than a letter or A4 format so that
-    # we only have to break staffs with every new detected staff
-    # This works well for electronic formats, if the results are supposed
-    # to get printed then they might need to be scaled down to fit the page
-    page_width = 110  # Unit is in tenths: https://www.w3.org/2021/06/musicxml40/musicxml-reference/elements/page-height/
-    page_height = 300
-    defaults = mxl.XMLDefaults()
-    page_layout = mxl.XMLPageLayout()
-    page_height = mxl.XMLPageHeight(value_=page_height)
-    page_width = mxl.XMLPageWidth(value_=page_width)
-    page_layout.add_child(page_height)
-    page_layout.add_child(page_width)
-    defaults.add_child(page_layout)
+def build_defaults(args: XmlGeneratorArguments) -> ET.Element:
+    defaults = ET.Element("defaults")
+    if args.large_page:
+        page_layout = ET.SubElement(defaults, "page-layout")
+        ET.SubElement(page_layout, "page-height").text = "300"
+        ET.SubElement(page_layout, "page-width").text = "110"
     return defaults
 
 
@@ -292,64 +389,72 @@ def _part_metadata(has_two_staves: bool) -> tuple[str, str, str, int]:
     return ("Voice", "Voice", "voice", 54)
 
 
-def build_part_list(has_two_staves_by_part: list[bool]) -> mxl.XMLPartList:
-    part_list = mxl.XMLPartList()
+def build_part_list(has_two_staves_by_part: list[bool]) -> ET.Element:
+    part_list = ET.Element("part-list")
     for part, has_two_staves in enumerate(has_two_staves_by_part):
         part_id = get_part_id(part)
         part_name_str, instrument_name_str, instrument_sound_str, midi_program = _part_metadata(
             has_two_staves
         )
-        score_part = mxl.XMLScorePart(id=part_id)
-        part_name = mxl.XMLPartName(value_=part_name_str)
-        score_part.add_child(part_name)
-        score_instrument = mxl.XMLScoreInstrument(id=part_id + "-I1")
-        instrument_name = mxl.XMLInstrumentName(value_=instrument_name_str)
-        score_instrument.add_child(instrument_name)
-        instrument_sound = mxl.XMLInstrumentSound(value_=instrument_sound_str)
-        score_instrument.add_child(instrument_sound)
-        score_part.add_child(score_instrument)
-        midi_instrument = mxl.XMLMidiInstrument(id=part_id + "-I1")
-        midi_instrument.add_child(mxl.XMLMidiChannel(value_=part + 1))
-        midi_instrument.add_child(mxl.XMLMidiProgram(value_=midi_program))
-        midi_instrument.add_child(mxl.XMLVolume(value_=100))
-        midi_instrument.add_child(mxl.XMLPan(value_=0))
-        score_part.add_child(midi_instrument)
-        part_list.add_child(score_part)
+        score_part = ET.SubElement(part_list, "score-part", id=part_id)
+        ET.SubElement(score_part, "part-name").text = part_name_str
+        score_instrument = ET.SubElement(score_part, "score-instrument", id=part_id + "-I1")
+        ET.SubElement(score_instrument, "instrument-name").text = instrument_name_str
+        ET.SubElement(score_instrument, "instrument-sound").text = instrument_sound_str
+        midi_instrument = ET.SubElement(score_part, "midi-instrument", id=part_id + "-I1")
+        ET.SubElement(midi_instrument, "midi-channel").text = str(part + 1)
+        ET.SubElement(midi_instrument, "midi-program").text = str(midi_program)
+        ET.SubElement(midi_instrument, "volume").text = "100"
+        ET.SubElement(midi_instrument, "pan").text = "0"
     return part_list
 
 
 def build_or_get_attributes(
-    measure: mxl.XMLMeasure, last_attributes: mxl.XMLAttributes | None, force_new: bool = False
-) -> mxl.XMLAttributes:
+    measure: ET.Element, last_attributes: ET.Element | None, force_new: bool = False
+) -> ET.Element:
     if last_attributes is not None and not force_new:
         return last_attributes
-
-    attributes = mxl.XMLAttributes()
-    measure.add_child(attributes)
-    return attributes
+    return ET.SubElement(measure, "attributes")
 
 
-def build_or_get_barline(measure: mxl.XMLMeasure, location: str) -> mxl.XMLBarline:
-    children = measure.get_children_of_type(mxl.XMLBarline)
-    for child in children:
-        if child.location == location:
+def build_or_get_barline(measure: ET.Element, location: str) -> ET.Element:
+    for child in measure:
+        if child.tag == "barline" and child.get("location") == location:
             return child
-
-    barline = mxl.XMLBarline(location=location)
-    measure.add_child(barline)
-    return barline
+    return ET.SubElement(measure, "barline", location=location)
 
 
-def build_key(model_key: EncodedSymbol, attributes: mxl.XMLAttributes) -> None:
-    key = mxl.XMLKey()
-    circle_of_fifth = model_key.rhythm.split("_")[1]
-    fifth = mxl.XMLFifths(value_=int(circle_of_fifth))
-    attributes.add_child(key)
-    key.add_child(fifth)
+def build_dynamic(model_dynamic: EncodedSymbol, measure: ET.Element) -> None:
+    marks: list[ET.Element] = []
+    if model_dynamic.rhythm.startswith("dynamic"):
+        dynamic_name = model_dynamic.rhythm.split("_", 1)[1]
+        # `dynamic_empty` is the internal placeholder used for a modifier-only
+        # marking (for example, "più"). It is not a MusicXML dynamics element.
+        if dynamic_name != "empty":
+            marks.append(ET.Element(dynamic_name))
+    if model_dynamic.articulation.startswith("dynamic"):
+        text = ET.Element("other-dynamics")
+        text.text = model_dynamic.articulation.split("_", 1)[1].replace("piu", "più")
+        marks.append(text)
+
+    if not marks:
+        return
+
+    direction = ET.SubElement(measure, "direction", placement="below")
+    direction_type = ET.SubElement(direction, "direction-type")
+    dynamics = ET.SubElement(direction_type, "dynamics")
+    dynamics.extend(marks)
+
+    ET.SubElement(direction, "staff").text = str(get_staff(model_dynamic))
+
+
+def build_key(model_key: EncodedSymbol, attributes: ET.Element) -> None:
+    key = ET.SubElement(attributes, "key")
+    ET.SubElement(key, "fifths").text = model_key.rhythm.split("_")[1]
 
 
 def get_staff(symbol: EncodedSymbol) -> int:
-    return 2 if symbol.position == "lower" else 1
+    return 2 if is_lower_position(symbol.position) else 1
 
 
 def get_xml_voice(staff_num: int, rhythmic_layer: int) -> int:
@@ -367,33 +472,33 @@ class TimedNoteEvent:
     staff_num: int
     start: int
     end: int
-    notes: list[mxl.XMLNote]
+    notes: list[ET.Element]
 
 
-def rebalance_measure_voices(measure: mxl.XMLMeasure) -> None:
+def rebalance_measure_voices(measure: ET.Element) -> None:
     """Assign stable non-overlapping voices per staff for a whole measure."""
     timed_events: list[TimedNoteEvent] = []
     current_time = 0
     last_note_start = 0
-    for child in measure.get_children():
-        if isinstance(child, mxl.XMLBackup):
-            durations = child.get_children_of_type(mxl.XMLDuration)
-            if len(durations) > 0:
-                current_time -= int(durations[0].value_)
+    for child in measure:
+        if child.tag == "backup":
+            dur = child.find("duration")
+            if dur is not None:
+                current_time -= int(dur.text)  # type: ignore[arg-type]
             continue
-        if child.__class__.__name__ == "XMLForward":
-            durations = child.get_children_of_type(mxl.XMLDuration)
-            if len(durations) > 0:
-                current_time += int(durations[0].value_)
+        if child.tag == "forward":
+            dur = child.find("duration")
+            if dur is not None:
+                current_time += int(dur.text)  # type: ignore[arg-type]
             continue
-        if not isinstance(child, mxl.XMLNote):
+        if child.tag != "note":
             continue
 
-        duration_nodes = child.get_children_of_type(mxl.XMLDuration)
-        duration = int(duration_nodes[0].value_) if len(duration_nodes) > 0 else 0
-        staff_nodes = child.get_children_of_type(mxl.XMLStaff)
-        staff_num = int(staff_nodes[0].value_) if len(staff_nodes) > 0 else 1
-        is_chord_tone = len(child.get_children_of_type(mxl.XMLChord)) > 0
+        dur_el = child.find("duration")
+        duration = int(dur_el.text) if dur_el is not None else 0  # type: ignore[arg-type]
+        staff_el = child.find("staff")
+        staff_num = int(staff_el.text) if staff_el is not None else 1  # type: ignore[arg-type]
+        is_chord_tone = child.find("chord") is not None
         start = last_note_start if is_chord_tone else current_time
         end = start + duration
         if is_chord_tone and (
@@ -416,7 +521,7 @@ def rebalance_measure_voices(measure: mxl.XMLMeasure) -> None:
 
     for staff_num, events in by_staff.items():
         sorted_events = sorted(events, key=lambda e: (e.start, e.end))
-        active: list[tuple[int, int]] = []  # (end, local voice number 1..n)
+        active: list[tuple[int, int]] = []
         for event in sorted_events:
             active = [
                 (active_end, voice_no)
@@ -424,67 +529,200 @@ def rebalance_measure_voices(measure: mxl.XMLMeasure) -> None:
                 if active_end > event.start
             ]
             used_voices = {voice_no for _, voice_no in active}
-            voice_no = 1
-            while voice_no in used_voices:
-                voice_no += 1
+            # The second voice of the model (e.g. upper2) prefers the second voice
+            voice_no = 2 if _is_second_voice(event.notes[0]) else 1
+            if voice_no in used_voices:
+                voice_no = 1
+                while voice_no in used_voices:
+                    voice_no += 1
             active.append((event.end, voice_no))
             xml_voice = str(get_xml_voice(staff_num, voice_no - 1))
             for note in event.notes:
-                voice_nodes = note.get_children_of_type(mxl.XMLVoice)
-                if len(voice_nodes) > 0:
-                    voice_nodes[0].value_ = xml_voice
+                voice_el = note.find("voice")
+                if voice_el is not None:
+                    voice_el.text = xml_voice
 
 
-def build_clef(model_clef: EncodedSymbol, attributes: mxl.XMLAttributes) -> None:
+# The position of the model (e.g. upper2) of a note while the part is built
+_POSITION_ATTRIBUTE = "homr-position"
+
+
+def _is_second_voice(note: ET.Element) -> bool:
+    return note.get(_POSITION_ATTRIBUTE, "").endswith("2")
+
+
+def _remove_position_attributes(part: ET.Element) -> None:
+    for note in part.iter("note"):
+        note.attrib.pop(_POSITION_ATTRIBUTE, None)
+
+
+def add_stems(part: ET.Element) -> None:
+    """
+    Where a staff has two voices in a measure, the first voice has its stems up
+    and the second one down. Other stems are left to the reader.
+    """
+    for measure in part.findall("measure"):
+        notes = [n for n in measure.findall("note") if n.find("rest") is None]
+        for staff in {n.findtext("staff", "1") for n in notes}:
+            on_staff = [n for n in notes if n.findtext("staff", "1") == staff]
+            voices = {_is_second_voice(n) for n in on_staff if n.get(_POSITION_ATTRIBUTE)}
+            if len(voices) < 2:
+                continue
+            for note in on_staff:
+                stem = ET.Element("stem")
+                stem.text = "down" if _is_second_voice(note) else "up"
+                staff_el = note.find("staff")
+                position = list(note).index(staff_el) if staff_el is not None else len(note)
+                note.insert(position, stem)
+
+
+def get_note_pitch(note: ET.Element) -> str | None:
+    pitch = note.find("pitch")
+    if pitch is None:
+        return None
+    return "|".join(pitch.findtext(part, "") for part in ("step", "alter", "octave"))
+
+
+def get_slur(note: ET.Element, slur_type: str) -> tuple[ET.Element, ET.Element] | None:
+    """The note's slur of this type with the notations holding it, if any.
+
+    build_slurs writes at most one start and one stop per note, so there is
+    never a choice to make here.
+    """
+    for notation in note.findall("notations"):
+        for slur in notation.findall("slur"):
+            if slur.get("type") == slur_type:
+                return slur, notation
+    return None
+
+
+def add_tie(note: ET.Element, tie_type: str, notation: ET.Element) -> None:
+    """A tie needs both elements: <tie> for what sounds, <tied> for what is drawn."""
+    tie = ET.Element("tie", type=tie_type)
+    duration = note.find("duration")
+    position = list(note).index(duration) + 1 if duration is not None else 0
+    note.insert(position, tie)
+    notation.insert(0, ET.Element("tied", type=tie_type))
+
+
+def convert_ties(part: ET.Element) -> None:
+    """Rewrite slurs which are really ties, over a whole part.
+
+    The model learns slurs and ties as one class on purpose, so a tie reaches
+    us as a slur. A slur is a tie when it joins a note to the very next note
+    of its own voice and both carry the same pitch.
+
+    Deliberately no attempt to pair slur starts with slur stops. The slur
+    number is the staff number, so several slurs open on one staff share a
+    number and cannot be told apart by it — four at once on a test file — and
+    any pairing rule would be guessing. A tie needs no pairing: it is a
+    property of a note and its immediate successor.
+
+    Run per part rather than per measure, because ties cross barlines. One
+    pass is enough: the last event seen in a voice is by definition the
+    predecessor of the next one in it.
+    """
+    previous: dict[tuple[str, str], list[ET.Element]] = {}
+    for measure in part.findall("measure"):
+        for event in group_into_events(measure):
+            first = event[0]
+            key = (first.findtext("staff", "1"), first.findtext("voice", "1"))
+            before = previous.get(key)
+            previous[key] = event
+            if before is None:
+                continue
+            tie_event(before, event)
+
+
+def group_into_events(measure: ET.Element) -> list[list[ET.Element]]:
+    """The measure's notes, with each chord kept together as one event.
+
+    A chord is one moment of the music, not several: <chord> means "sounds
+    with the note before". Walking notes one at a time makes a chord's own
+    members each other's neighbours, so nothing in a chord ever finds the note
+    it is really adjacent to, and no tie between two chords is ever seen.
+    """
+    events: list[list[ET.Element]] = []
+    for note in measure.findall("note"):
+        if note.find("chord") is not None and events:
+            events[-1].append(note)
+        else:
+            events.append([note])
+    return events
+
+
+def tie_event(before: list[ET.Element], after: list[ET.Element]) -> None:
+    """Convert every slur between two adjacent events that is really a tie.
+
+    Matched by pitch, and led by the slurs: the model marks the notehead the
+    curve touches, which on a chord is one member and not the whole thing -
+    of the chords carrying a slur on my test material, 25 of 26 had it on
+    some members only. So each slurred note looks for its own pitch in the
+    next event rather than the chord being taken as a whole.
+    """
+    for start_note in before:
+        begins = get_slur(start_note, "start")
+        if begins is None:
+            continue
+        pitch = get_note_pitch(start_note)
+        if pitch is None:
+            continue
+        for stop_note in after:
+            if get_note_pitch(stop_note) != pitch:
+                continue
+            ends = get_slur(stop_note, "stop")
+            if ends is None:
+                continue
+            begin_slur, begin_notation = begins
+            end_slur, end_notation = ends
+            begin_notation.remove(begin_slur)
+            end_notation.remove(end_slur)
+            add_tie(start_note, "start", begin_notation)
+            add_tie(stop_note, "stop", end_notation)
+            break
+
+
+def build_clef(model_clef: EncodedSymbol, attributes: ET.Element) -> None:
     sign_and_line = model_clef.rhythm.split("_")[1]
-    sign = sign_and_line[0]
-    line = sign_and_line[1]
-    clef = mxl.XMLClef(number=get_staff(model_clef))
-    attributes.add_child(clef)
-    clef.add_child(mxl.XMLSign(value_=sign))
-    clef.add_child(mxl.XMLLine(value_=int(line)))
+    clef = ET.SubElement(attributes, "clef", number=str(get_staff(model_clef)))
+    ET.SubElement(clef, "sign").text = sign_and_line[0]
+    ET.SubElement(clef, "line").text = sign_and_line[1]
 
 
 def build_time_signature(
-    model_time_signature: EncodedSymbol, attributes: mxl.XMLAttributes, state: ConversionState
+    model_time_signature: EncodedSymbol, attributes: ET.Element, state: ConversionState
 ) -> None:
-    time = mxl.XMLTime()
-
+    time = ET.SubElement(attributes, "time")
     denominator = model_time_signature.rhythm.split("/")[1]
-    attributes.add_child(time)
     beats = max(int(state.nominator * int(denominator)), 1)
-    time.add_child(mxl.XMLBeats(value_=str(beats)))
-    time.add_child(mxl.XMLBeatType(value_=denominator))
+    ET.SubElement(time, "beats").text = str(beats)
+    ET.SubElement(time, "beat-type").text = denominator
     state.beats = beats
 
 
-def build_barline_style(barline: EncodedSymbol, xml: mxl.XMLBarline) -> None:
+def build_barline_style(barline: EncodedSymbol, xml: ET.Element) -> None:
     style_value = "heavy-heavy" if barline.rhythm == "bolddoublebarline" else "light-light"
-    style = mxl.XMLBarStyle(value_=style_value)
-    xml.add_child(style)
+    ET.SubElement(xml, "bar-style").text = style_value
 
 
-def build_barline_ending(volta: EncodedSymbol, xml: mxl.XMLBarline, volta_number: int) -> None:
+def build_barline_ending(volta: EncodedSymbol, xml: ET.Element, volta_number: int) -> None:
     if volta.rhythm.startswith("voltaStart"):
-        ending = mxl.XMLEnding(type="start", number=str(volta_number))
+        type_ = "start"
     elif volta.rhythm.startswith("voltaStop"):
-        ending = mxl.XMLEnding(type="stop", number=str(volta_number))
+        type_ = "stop"
     elif volta.rhythm.startswith("voltaDiscontinue"):
-        ending = mxl.XMLEnding(type="discontinue", number=str(volta_number))
+        type_ = "discontinue"
     else:
         raise ValueError("Unknown ending " + str(volta))
-    xml.add_child(ending)
+    ET.SubElement(xml, "ending", type=type_, number=str(volta_number))
 
 
-def build_repeat(barline: EncodedSymbol, xml: mxl.XMLBarline) -> None:
-    if len(xml.get_children_of_type(mxl.XMLRepeat)) > 0:
+def build_repeat(barline: EncodedSymbol, xml: ET.Element) -> None:
+    if xml.find("repeat") is not None:
         eprint("barline already has a repeat")
         return
-
-    repeat = mxl.XMLRepeat()
     direction = "forward" if barline.rhythm == "repeatStart" else "backward"
-    repeat._set_attributes({"direction": direction})
-    xml.add_child(repeat)
+    ET.SubElement(xml, "repeat", direction=direction)
 
 
 LIFT_TO_ALTER = {
@@ -508,80 +746,93 @@ DURATION_NAMES = {
 }
 
 
-def _tie_types(articulations: str) -> list[str]:
-    markers = set(articulations.split("_"))
-    return [kind for kind in ("stop", "start") if "tie" + kind.capitalize() in markers]
-
-
 def build_articulations(
-    note: mxl.XMLNote, articualations: str, tuplet_marks: tuple[str, ...], state: ConversionState
+    note: ET.Element, articualations: str, tuplet_mark: str, state: ConversionState
 ) -> None:
-    notation = mxl.XMLNotations()
-    note.add_child(notation)
+    notation = ET.SubElement(note, "notations")
 
-    xml_articulations = []
-    xml_ornaments = []
+    xml_articulations: list[ET.Element] = []
+    xml_ornaments: list[ET.Element] = []
+    if not articualations.startswith("dynamic"):
+        for articulation in articualations.split("_"):
+            if articulation == "":
+                continue
+            elif articulation == nonote:
+                eprint("WARNING note without valid articulation", articualations)
+            elif articulation == "fermata":
+                ET.SubElement(notation, "fermata")
+            elif articulation == "arpeggiate":
+                ET.SubElement(notation, "arpeggiate")
+            elif articulation == "accent":
+                xml_articulations.append(ET.Element("accent"))
+            elif articulation == "accentStrong":
+                xml_articulations.append(ET.Element("strong-accent"))
+            elif articulation == "mordent":
+                xml_articulations.append(ET.Element("mordent"))
+            elif articulation == "staccato":
+                xml_articulations.append(ET.Element("staccato"))
+            elif articulation == "staccatissimo":
+                xml_articulations.append(ET.Element("staccatissimo"))
+            elif articulation == "tenuto":
+                xml_articulations.append(ET.Element("tenuto"))
+            elif articulation == "tremolo":
+                el = ET.Element("tremolo", type=state.toggle_tremolo_state())
+                el.text = "3"
+                xml_ornaments.append(el)
+            elif articulation == "trill":
+                xml_ornaments.append(ET.Element("trill-mark"))
+            elif articulation == "breathMark":
+                xml_articulations.append(ET.Element("breath-mark"))
+            elif articulation == "turn":
+                xml_ornaments.append(ET.Element("inverted-turn"))
+            elif articulation == "caesura":
+                xml_articulations.append(ET.Element("caesura"))
+            elif articulation == "doit":
+                xml_articulations.append(ET.Element("doit"))
+            elif articulation == "slurStart":
+                ET.SubElement(notation, "slur", type="start")
+            elif articulation == "slurStop":
+                ET.SubElement(notation, "slur", type="stop")
+            elif articulation == "tieStart":
+                ET.SubElement(notation, "tied", type="start")
+            elif articulation == "tieStop":
+                ET.SubElement(notation, "tied", type="stop")
+            else:
+                raise ValueError("Unsupported articulation " + articulation)
 
-    for articulation in articualations.split("_"):
-        if articulation == "":
-            continue
-        elif articulation == nonote:
-            eprint("WARNING note without valid articulation", articualations)
-        elif articulation == "fermata":
-            notation.add_child(mxl.XMLFermata())
-        elif articulation == "arpeggiate":
-            notation.add_child(mxl.XMLArpeggiate())
-        elif articulation == "accent":
-            xml_articulations.append(mxl.XMLAccent())
-        elif articulation == "arpeggiate":
-            notation.add_child(mxl.XMLArpeggiate())
-        elif articulation == "fermata":
-            xml_articulations.append(mxl.XMLFermata())
-        elif articulation == "staccato":
-            xml_articulations.append(mxl.XMLStaccato())
-        elif articulation == "staccatissimo":
-            xml_articulations.append(mxl.XMLStaccatissimo())
-        elif articulation == "tenuto":
-            xml_articulations.append(mxl.XMLTenuto())
-        elif articulation == "tremolo":
-            xml_ornaments.append(mxl.XMLTremolo(value_=3, type=state.toggle_tremolo_state()))
-        elif articulation == "trill":
-            xml_ornaments.append(mxl.XMLTrillMark())
-        elif articulation == "breathMark":
-            xml_articulations.append(mxl.XMLBreathMark())
-        elif articulation == "turn":
-            xml_ornaments.append(mxl.XMLInvertedTurn())
-        elif articulation == "caesura":
-            xml_articulations.append(mxl.XMLCaesura())
-        elif articulation == "doit":
-            xml_articulations.append(mxl.XMLDoit())
-        elif articulation == "slurStart":
-            notation.add_child(mxl.XMLSlur(type="start"))
-        elif articulation == "slurStop":
-            notation.add_child(mxl.XMLSlur(type="stop"))
-        elif articulation in ("tieStart", "tieStop"):
-            # A continuation ends the preceding tie before starting the next.
-            continue
-        else:
-            raise ValueError("Unsupported articulation " + articulation)
+    for mark in tuplet_mark.split("_"):
+        if mark:
+            ET.SubElement(notation, "tuplet", type=mark)
 
-    for tie_type in _tie_types(articualations):
-        notation.add_child(mxl.XMLTied(type=tie_type))
-
-    for tuplet_mark in tuplet_marks:
-        notation.add_child(mxl.XMLTuplet(type=tuplet_mark))
-
-    if len(xml_articulations) > 0:
-        parent = mxl.XMLArticulations()
+    if xml_articulations:
+        parent = ET.SubElement(notation, "articulations")
         for child in xml_articulations:
-            parent.add_child(child)
-        notation.add_child(parent)
+            parent.append(child)
 
-    if len(xml_ornaments) > 0:
-        parent = mxl.XMLOrnaments()
+    if xml_ornaments:
+        parent = ET.SubElement(notation, "ornaments")
         for child in xml_ornaments:
-            parent.add_child(child)
-        notation.add_child(parent)
+            parent.append(child)
+
+
+def build_slurs(note: ET.Element, slurs: str, slur_number: int) -> None:
+    notation = note.find("notations")
+    if notation is None:
+        notation = ET.SubElement(note, "notations")
+
+    if slurs in {"_", ""}:
+        pass
+    elif slurs == nonote:
+        eprint("WARNING note without valid articulation", slurs)
+    elif slurs == "slurStart":
+        ET.SubElement(notation, "slur", type="start", number=str(slur_number))
+    elif slurs == "slurStop":
+        ET.SubElement(notation, "slur", type="stop", number=str(slur_number))
+    elif slurs == "slurStart_slurStop":
+        ET.SubElement(notation, "slur", type="stop", number=str(slur_number))
+        ET.SubElement(notation, "slur", type="start", number=str(slur_number))
+    else:
+        raise ValueError("Unsupported slur " + slurs)
 
 
 def build_note_or_rest(
@@ -589,108 +840,150 @@ def build_note_or_rest(
     rhythmic_layer: int,
     is_chord: bool,
     state: ConversionState,
-    tuplet_marks: tuple[str, ...],
-) -> mxl.XMLNote:
-    note = mxl.XMLNote()
+    tuplet_mark: str,
+) -> ET.Element:
+    note = ET.Element("note")
     if is_chord:
-        note.add_child(mxl.XMLChord())
+        ET.SubElement(note, "chord")
     model_pitch = model_note.pitch
     model_duration = model_note.get_duration()
+
+    if "G" in model_note.rhythm:
+        ET.SubElement(note, "grace")
+
     if model_pitch == empty:
         if model_duration.fraction.numerator == 0:
-            note.add_child(mxl.XMLRest(measure="yes"))
+            ET.SubElement(note, "rest", measure="yes")
         else:
-            note.add_child(mxl.XMLRest())
+            ET.SubElement(note, "rest")
     elif model_pitch == nonote:
         eprint("WARNING note without pitch", model_note)
-        note.add_child(mxl.XMLRest())
+        ET.SubElement(note, "rest")
     else:
-        pitch = mxl.XMLPitch()
-        pitch.add_child(mxl.XMLStep(value_=model_pitch[0]))
-        pitch.add_child(mxl.XMLOctave(value_=int(model_pitch[1])))
+        pitch = ET.SubElement(note, "pitch")
+        ET.SubElement(pitch, "step").text = model_pitch[0]
+        ET.SubElement(pitch, "octave").text = model_pitch[1]
         if model_note.lift == nonote:
             eprint("WARNING note with invalid lift", model_note)
         elif model_note.lift != empty:
-            pitch.add_child(mxl.XMLAlter(value_=LIFT_TO_ALTER[model_note.lift]))
-        note.add_child(pitch)
+            ET.SubElement(pitch, "alter").text = str(LIFT_TO_ALTER[model_note.lift])
 
     if "G" in model_note.rhythm:
-        note.add_child(mxl.XMLGrace())
         base_duration = model_duration.kern
-        duration_name = DURATION_NAMES[base_duration]
-        note.add_child(mxl.XMLType(value_=duration_name))
+        ET.SubElement(note, "type").text = DURATION_NAMES[base_duration]
     elif model_duration.fraction.numerator > 0:
         base_duration = 1 if model_duration.kern == 0 else model_duration.kern
-        duration_name = DURATION_NAMES[base_duration]
-        note.add_child(mxl.XMLType(value_=duration_name))
-        note.add_child(mxl.XMLDuration(value_=int(model_duration.fraction * state.division)))
+        ET.SubElement(note, "duration").text = str(
+            max(1, int(model_duration.fraction * state.division))
+        )
+        ET.SubElement(note, "type").text = DURATION_NAMES[base_duration]
     else:
-        duration_name = DURATION_NAMES[0]
-        note.add_child(mxl.XMLType(value_=duration_name))
-        note.add_child(mxl.XMLDuration(value_=state.beats))
+        ET.SubElement(note, "duration").text = str(state.beats)
+        ET.SubElement(note, "type").text = DURATION_NAMES[0]
 
-    for tie_type in _tie_types(model_note.articulation):
-        note.add_child(mxl.XMLTie(type=tie_type))
+    for _ in range(model_duration.dots):
+        ET.SubElement(note, "dot")
+
+    if model_duration.actual_notes != model_duration.normal_notes:
+        time_mod = ET.SubElement(note, "time-modification")
+        ET.SubElement(time_mod, "actual-notes").text = str(model_duration.actual_notes)
+        ET.SubElement(time_mod, "normal-notes").text = str(model_duration.normal_notes)
 
     staff_num = get_staff(model_note)
-    note.add_child(mxl.XMLStaff(value_=staff_num))
-    note.add_child(mxl.XMLVoice(value_=str(get_xml_voice(staff_num, rhythmic_layer))))
-    for _ in range(model_duration.dots):
-        note.add_child(mxl.XMLDot())
-    if model_duration.actual_notes != model_duration.normal_notes:
-        time_modification = mxl.XMLTimeModification()
-        time_modification.add_child(mxl.XMLActualNotes(value_=model_duration.actual_notes))
-        time_modification.add_child(mxl.XMLNormalNotes(value_=model_duration.normal_notes))
-        note.add_child(time_modification)
-        build_articulations(note, model_note.articulation, tuplet_marks, state)
-    else:
-        build_articulations(note, model_note.articulation, (), state)
+    slur_number = staff_num
+    ET.SubElement(note, "voice").text = str(get_xml_voice(staff_num, rhythmic_layer))
+    ET.SubElement(note, "staff").text = str(staff_num)
+    # Used for voices and stems, removed at the end of build_part
+    note.set(_POSITION_ATTRIBUTE, model_note.position)
+
+    # The other notes of a group, e.g. in the other staff, aren't part of the tuplet
+    is_tuplet = model_duration.actual_notes != model_duration.normal_notes
+    build_articulations(note, model_note.articulation, tuplet_mark if is_tuplet else "", state)
+    build_slurs(note, model_note.slur, slur_number)
+    build_image_position(note, model_note)
 
     return note
 
 
-def build_multi_measure_rest(
-    symbol: EncodedSymbol, attributes: mxl.XMLAttributes
-) -> mxl.XMLMeasureStyle:
-    other_styles = attributes.get_children_of_type(mxl.XMLMeasureStyle)
-    if len(other_styles) > 0:
-        eprint("Measure already has a multi rest")
+def build_image_position(xml: ET.Element, symbol: EncodedSymbol) -> None:
+    """
+    Adds the position of the symbol on the input image as comment. The position is estimated
+    from the attention of the transformer, it points roughly at the symbol but isn't precise.
+    """
+    if symbol.image_coordinates is None:
         return
+    x, y = symbol.image_coordinates
+    xml.append(ET.Comment(f" imgpos: {round(x)}, {round(y)} "))
+
+
+def build_multi_measure_rest(symbol: EncodedSymbol, attributes: ET.Element) -> int:
+    """Returns the number of measures of the rest, 0 if the measure already has one."""
+    if attributes.find("measure-style") is not None:
+        eprint("Measure already has a multi rest")
+        return 0
     duration = int(symbol.rhythm.split("_")[1].replace("m", ""))
-    style = mxl.XMLMeasureStyle()
-    rest = mxl.XMLMultipleRest(value_=duration)
-    style.add_child(rest)
-    attributes.add_child(style)
+    style = ET.SubElement(attributes, "measure-style")
+    ET.SubElement(style, "multiple-rest").text = str(duration)
+    return duration
+
+
+def build_measure_rest(symbol: EncodedSymbol, state: ConversionState) -> ET.Element:
+    """A rest which fills the measure, e.g. in a staff which is hidden in a system."""
+    note = ET.Element("note")
+    ET.SubElement(note, "rest", measure="yes")
+    duration = max(1, int(state.nominator * state.division))
+    ET.SubElement(note, "duration").text = str(duration)
+    ET.SubElement(note, "voice").text = "1"
+    ET.SubElement(note, "staff").text = str(get_staff(symbol))
+    return note
+
+
+def build_forward(duration: Fraction, state: ConversionState) -> ET.Element:
+    forward = ET.Element("forward")
+    ET.SubElement(forward, "duration").text = str(max(1, int(duration * state.division)))
+    return forward
+
+
+def build_backup(duration: Fraction, state: ConversionState) -> ET.Element:
+    assert duration > Fraction(0), "Backup duration must be positive"
+    backup = ET.Element("backup")
+    ET.SubElement(backup, "duration").text = str(max(1, int(duration * state.division)))
+    return backup
 
 
 def build_note_chord(
     note_chord: SymbolChord, state: ConversionState, chord_duration: Fraction
-) -> list[mxl.XMLElement]:
+) -> list[ET.Element]:
     by_duration = _group_notes(note_chord.symbols)
-    result: list[mxl.XMLElement] = []
-    final_duration = Fraction(0)
-    sorted_durations = sorted(by_duration)
-    for i, group_duration in enumerate(sorted_durations):
+    result: list[ET.Element] = []
+    for i, (group_duration, group_notes) in enumerate(by_duration.items()):
+        notes = [n for n in group_notes if n.pitch not in (empty, nonote)]
+        rests = [n for n in group_notes if n.pitch in (empty, nonote)]
+
         is_first = True
-        for note_loop in by_duration[group_duration]:
-            note = note_loop
-            marks = note_chord.tuplet_marks.get(note.position, ()) if is_first else ()
-            result.append(build_note_or_rest(note, i, not is_first, state, marks))
+        for note in notes:
+            result.append(
+                build_note_or_rest(note, i, not is_first, state, note_chord.mark_for(note))
+            )
             is_first = False
-        if i != len(sorted_durations) - 1 and group_duration > Fraction(0):
-            backup = mxl.XMLBackup()
-            backup.add_child(mxl.XMLDuration(value_=int(group_duration * state.division)))
-            result.append(backup)
 
-        final_duration = group_duration
+        # A grace note without pitch would be a rest which takes no time
+        if rests and group_duration > Fraction(0):
+            if notes:
+                # There are other notes, so to avoid rest being merged into chord, we emit a backup
+                result.append(build_backup(group_duration, state))
+            # Ideally we expect len(rests) == 1, but in dataset we see cases where
+            # there are multiple rests. So here we just take the first rest
+            result.append(
+                build_note_or_rest(rests[0], i, False, state, note_chord.mark_for(rests[0]))
+            )
 
-    # Reset the position to match the chord position
-    if chord_duration < final_duration:
-        backup = mxl.XMLBackup()
-        backup.add_child(
-            mxl.XMLDuration(value_=int((final_duration - chord_duration) * state.division))
-        )
-        result.append(backup)
+        if i != len(by_duration) - 1 and group_duration > Fraction(0):
+            result.append(build_backup(group_duration, state))
+
+    if chord_duration < max(by_duration):
+        result.append(build_backup(max(by_duration) - chord_duration, state))
+
     return result
 
 
@@ -703,30 +996,23 @@ def _group_notes(notes: list[EncodedSymbol]) -> dict[Fraction, list[EncodedSymbo
         if is_grace:
             fraction = Fraction(0)
         elif duration.fraction.numerator == 0:
-            # Whole measure rest
             fraction = max_duration
         else:
             fraction = duration.fraction
         groups_by_duration[fraction].append(note)
-    return groups_by_duration
+    return dict(sorted(groups_by_duration.items()))
 
 
-def build_add_time_direction(args: XmlGeneratorArguments) -> mxl.XMLDirection | None:
+def build_add_time_direction(args: XmlGeneratorArguments) -> ET.Element | None:
     if not args.metronome:
         return None
-    direction = mxl.XMLDirection()
-    direction_type = mxl.XMLDirectionType()
-    direction.add_child(direction_type)
-    metronome = mxl.XMLMetronome()
-    direction_type.add_child(metronome)
-    beat_unit = mxl.XMLBeatUnit(value_="quarter")
-    metronome.add_child(beat_unit)
-    per_minute = mxl.XMLPerMinute(value_=str(args.metronome))
-    metronome.add_child(per_minute)
-    if args.tempo:
-        direction.add_child(mxl.XMLSound(tempo=args.tempo))
-    else:
-        direction.add_child(mxl.XMLSound(tempo=args.metronome))
+    direction = ET.Element("direction")
+    direction_type = ET.SubElement(direction, "direction-type")
+    metronome = ET.SubElement(direction_type, "metronome")
+    ET.SubElement(metronome, "beat-unit").text = "quarter"
+    ET.SubElement(metronome, "per-minute").text = str(args.metronome)
+    tempo = args.tempo if args.tempo else args.metronome
+    ET.SubElement(direction, "sound", tempo=str(tempo))
     return direction
 
 
@@ -748,90 +1034,257 @@ def find_common_division(durations: list[Fraction]) -> int:
     return common
 
 
-def find_division_and_time_signature_nominator(voice: list[SymbolChord]) -> tuple[int, Fraction]:
+def find_division_and_time_signature_nominators(
+    voice: list[SymbolChord],
+) -> tuple[int, list[Fraction]]:
+    """
+    Returns the division and one measure length per time signature, estimated from the
+    measures up to the next time signature. Measures before the first one count towards it.
+    """
     durations = [Fraction(1, 4)]
     duration_in_measure = Fraction(0)
-    measure_duration = []
+    segments: list[list[Fraction]] = [[]]
+    has_time_signature = False
     for chord in voice:
-        if chord.is_barline() and duration_in_measure > Fraction(0):
-            measure_duration.append(duration_in_measure)
+        if chord.symbols and chord.symbols[0].rhythm.startswith("timeSignature"):
+            if duration_in_measure > Fraction(0):
+                segments[-1].append(duration_in_measure)
+                duration_in_measure = Fraction(0)
+            if has_time_signature:
+                segments.append([])
+            has_time_signature = True
+        elif chord.is_barline() and duration_in_measure > Fraction(0):
+            segments[-1].append(duration_in_measure)
             duration_in_measure = Fraction(0)
         else:
+            for symbol in chord.symbols:
+                if symbol.rhythm.startswith(("note", "rest")):
+                    frac = symbol.get_duration().fraction
+                    if frac > Fraction(0):
+                        durations.append(frac)
             duration = chord.get_duration()
             if duration > Fraction(0):
-                durations.append(duration)
                 duration_in_measure += duration
 
     if duration_in_measure > Fraction(0):
-        measure_duration.append(duration_in_measure)
-        duration_in_measure = Fraction(0)
+        segments[-1].append(duration_in_measure)
 
-    if len(measure_duration) == 0:
-        return find_common_division(durations), Fraction(1)
+    all_measures = [d for segment in segments for d in segment]
+    if len(all_measures) == 0:
+        return find_common_division(durations), [Fraction(1)] * len(segments)
 
-    nominator: Fraction = np.median(measure_duration)  # type: ignore
+    # A time signature without measures after it, e.g. a courtesy one at the end of a
+    # system, belongs to the measures of the next one
+    nominators: list[Fraction] = []
+    following: Fraction = np.median(all_measures)  # type: ignore
+    for segment in reversed(segments):
+        if segment:
+            following = np.median(segment)  # type: ignore
+        nominators.append(following)
+    nominators.reverse()
 
-    return find_common_division(durations), nominator
+    return find_common_division(durations), nominators
+
+
+_BEFORE_NOTES_ORDER = ["clef", "keySignature", "timeSignature"]
+
+
+def _split_mixed_chord(symbols: list[EncodedSymbol]) -> list[list[EncodedSymbol]]:
+    """
+    The transformer sometimes joins a clef, key, time signature or barline to a chord
+    of notes, e.g. a clef change in one staff on the beat where the other staff plays.
+    build_measures handles a group by its first symbol: if that is a note the extra
+    symbol becomes a zero-length rest (and fails an assertion), otherwise the notes
+    are dropped. Split it: clefs, keys and time signatures go before the notes (in
+    the order they have at the start of a line), barlines and repeats after them.
+    """
+    notes = [s for s in symbols if s.rhythm.startswith(("note", "rest"))]
+    if not notes or len(notes) == len(symbols):
+        return [symbols]
+    others = [s for s in symbols if not s.rhythm.startswith(("note", "rest"))]
+    after = [s for s in others if "barline" in s.rhythm or "repeat" in s.rhythm]
+    before: dict[str, list[EncodedSymbol]] = defaultdict(list)
+    for s in others:
+        if s not in after:
+            before[s.rhythm.split("_")[0].split("/")[0]].append(s)
+    rank = {kind: i for i, kind in enumerate(_BEFORE_NOTES_ORDER)}
+    ordered = sorted(before, key=lambda kind: rank.get(kind, len(rank)))
+    return [*(before[kind] for kind in ordered), notes, *([s] for s in after)]
+
+
+def split_mixed_chords(groups: list[SymbolChord]) -> list[SymbolChord]:
+    """
+    Applies _split_mixed_chord to every group. Runs after the tuplet marks are set, so
+    the notes keep their mark and a split-off clef doesn't interrupt a tuplet.
+    """
+    result: list[SymbolChord] = []
+    split_barline = False
+    for group in groups:
+        parts = _split_mixed_chord(group.symbols)
+        if split_barline and group.is_barline() and len(parts) == 1:
+            # The barline split off the previous chord and this one are the same barline:
+            # keep one, preferring a repeat or double barline over a plain barline.
+            if group.symbols[0].rhythm == "barline" and result[-1].symbols[0].rhythm != "barline":
+                split_barline = False
+                continue
+            result.pop()
+        for part in parts:
+            is_notes = part[0].rhythm.startswith(("note", "rest"))
+            result.append(SymbolChord(part, group.tuplet_marks if is_notes else {}))
+        split_barline = len(parts) > 1 and result[-1].is_barline()
+    return result
 
 
 def group_into_chords(voice: list[EncodedSymbol]) -> list[SymbolChord]:
     return [SymbolChord(s) for s in sort_token_chords(voice)]
 
 
-def _mark_tuplet_run(position: str, run: list[tuple[SymbolChord, SymbolDuration]]) -> None:
-    if not run:
-        return
-    # The sequence has durations but no explicit bracket boundaries. Infer simple
-    # groups from the smallest written value in this uninterrupted, same-ratio run.
-    unit = min(
-        duration.fraction * Fraction(duration.actual_notes, duration.normal_notes)
-        for _, duration in run
-    )
-    group_duration = unit * run[0][1].normal_notes
-    elapsed = Fraction(0)
-    for index, (group, duration) in enumerate(run):
-        marks: tuple[str, ...] = ("start",) if elapsed == 0 else ()
-        elapsed += duration.fraction
-        if elapsed >= group_duration or index == len(run) - 1:
-            marks += ("stop",)
-            elapsed = Fraction(0)
-        group.tuplet_marks[position] = marks
+class TupletParser:
+    """
+    Marks the start and stop of tuplets, per measure and position. A tuplet ends
+    with the note which ends on the beat grid again, e.g. after three eighth
+    triplets or a quarter and an eighth triplet. Counting by time rather than by
+    notes keeps a voice in phase whose tuplet begins with a rest in another voice.
+    Groups without a tuplet note at the position, e.g. a duplet in the other
+    staff, are skipped.
+    """
+
+    @staticmethod
+    def parse(groups: list[SymbolChord]) -> list[SymbolChord]:
+        for measure_groups in TupletParser.split_into_measures(groups):
+            positions = {
+                symbol.position
+                for group in measure_groups
+                for symbol in group.symbols
+                if TupletParser._is_tuplet(symbol)
+            }
+            for position in sorted(positions):
+                TupletParser.add_tuplets(measure_groups, position)
+        return groups
+
+    @staticmethod
+    def _is_tuplet(symbol: EncodedSymbol) -> bool:
+        if not symbol.rhythm.startswith(("note", "rest")) or "G" in symbol.rhythm:
+            return False
+        duration = symbol.get_duration()
+        return duration.normal_notes != duration.actual_notes
+
+    @staticmethod
+    def get_duration_at(group: SymbolChord, position: str) -> SymbolDuration | None:
+        """
+        The duration of the first tuplet note or rest at the position, otherwise of the
+        first timed one. None if the position has no timed symbol.
+        """
+        timed = [
+            s
+            for s in group.symbols
+            if s.position == position
+            and s.rhythm.startswith(("note", "rest"))
+            and "G" not in s.rhythm
+        ]
+        tuplets = [s for s in timed if TupletParser._is_tuplet(s)]
+        if tuplets:
+            return tuplets[0].get_duration()
+        if timed:
+            return timed[0].get_duration()
+        return None
+
+    @staticmethod
+    def split_into_measures(groups: list[SymbolChord]) -> list[list[SymbolChord]]:
+        measures: list[list[SymbolChord]] = []
+        current_measure: list[SymbolChord] = []
+        for group in groups:
+            current_measure.append(group)
+            if group.is_barline():
+                measures.append(current_measure)
+                current_measure = []
+        if current_measure:
+            measures.append(current_measure)
+        return measures
+
+    @staticmethod
+    def start_times(groups: list[SymbolChord]) -> list[Fraction]:
+        """When each group of a measure starts, the same way as build_measures counts."""
+        clock = GroupClock()
+        result: list[Fraction] = []
+        for group in groups:
+            if any(s.rhythm.startswith(("note", "rest")) for s in group.symbols):
+                clock.wait_for_voices(group)
+                result.append(clock.time)
+                clock.advance(group)
+            else:
+                result.append(clock.time)
+        return result
+
+    @staticmethod
+    def add_tuplets(groups: list[SymbolChord], position: str) -> None:
+        times = TupletParser.start_times(groups)
+        run: list[tuple[int, Fraction, Fraction]] = []  # group, start time and duration
+        tuplet_format = (1, 1)
+        for index, group in enumerate(groups):
+            duration = TupletParser.get_duration_at(group, position)
+            if duration is None:
+                continue
+            current_format = (duration.actual_notes, duration.normal_notes)
+            if current_format != tuplet_format and run:
+                TupletParser._mark_run(groups, position, run)
+                run = []
+            tuplet_format = current_format
+            if current_format[0] != current_format[1]:
+                run.append((index, times[index], duration.fraction))
+        if run:
+            TupletParser._mark_run(groups, position, run)
+
+    @staticmethod
+    def _mark_run(
+        groups: list[SymbolChord], position: str, run: list[tuple[int, Fraction, Fraction]]
+    ) -> None:
+        """
+        Splits consecutive tuplet notes of one position into tuplets. A tuplet ends once
+        its own notes add up to a duration without a tuplet, e.g. three eighth triplets or
+        a quarter and an eighth triplet. That keeps working if an earlier note has a wrong
+        length. If that leaves notes over, e.g. if the tuplet starts with a rest in another
+        voice, a tuplet ends where it reaches the beat grid instead. Notes which are
+        left over form an incomplete tuplet.
+        """
+        by_length = TupletParser._split(run, lambda start, total, end: total)
+        by_grid = TupletParser._split(run, lambda start, total, end: end)
+        tuplets, left_over = by_length if len(by_length[1]) <= len(by_grid[1]) else by_grid
+        if left_over:
+            # An incomplete tuplet, e.g. one note too many, still has tuplet durations
+            tuplets.append((left_over[0], left_over[-1]))
+        for first, last in tuplets:
+            if first == last:
+                groups[first].tuplet_marks[position] = "start_stop"
+            else:
+                groups[first].tuplet_marks[position] = "start"
+                groups[last].tuplet_marks[position] = "stop"
+
+    @staticmethod
+    def _split(
+        run: list[tuple[int, Fraction, Fraction]],
+        measure: Callable[[Fraction, Fraction, Fraction], Fraction],
+    ) -> tuple[list[tuple[int, int]], list[int]]:
+        """The complete tuplets as (first, last) group and the groups left over."""
+        tuplets: list[tuple[int, int]] = []
+        pending: list[int] = []
+        total = Fraction(0)
+        for index, start, duration in run:
+            pending.append(index)
+            total += duration
+            if _is_power_of_two(measure(start, total, start + duration).denominator):
+                tuplets.append((pending[0], index))
+                pending = []
+                total = Fraction(0)
+        return tuplets, pending
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and value & (value - 1) == 0
 
 
 def add_tuplet_start_stop(groups: list[SymbolChord]) -> list[SymbolChord]:
-    runs: dict[str, list[tuple[SymbolChord, SymbolDuration]]] = defaultdict(list)
-    for group in groups:
-        group.tuplet_marks = {}
-        if group.is_barline():
-            for position, run in runs.items():
-                _mark_tuplet_run(position, run)
-            runs.clear()
-            continue
-        by_position: dict[str, list[SymbolDuration]] = defaultdict(list)
-        for symbol in group.symbols:
-            if symbol.rhythm.startswith(("note", "rest")):
-                duration = symbol.get_duration()
-                if duration.fraction > 0:
-                    by_position[symbol.position].append(duration)
-        for position, durations in by_position.items():
-            duration = min(durations, key=lambda d: d.fraction)
-            run = runs[position]
-            ratio = (duration.actual_notes, duration.normal_notes)
-            if run and ratio != (run[-1][1].actual_notes, run[-1][1].normal_notes):
-                _mark_tuplet_run(position, run)
-                run = runs[position] = []
-            if duration.actual_notes != duration.normal_notes:
-                run.append((group, duration))
-    for position, run in runs.items():
-        _mark_tuplet_run(position, run)
-    return groups
-
-
-def build_divisions(division: int) -> mxl.XMLDivisions:
-    # The divisions element indicates how many divisions per quarter(!) note are
-    # used to indicate a note's duration
-    # https://usermanuals.musicxml.com/MusicXML/Content/EL-MusicXML-divisions.htm
-    return mxl.XMLDivisions(value_=division // 4)
+    return TupletParser.parse(groups)
 
 
 if __name__ == "__main__":
@@ -844,4 +1297,6 @@ if __name__ == "__main__":
         file = sys.argv[1]
     tokens = read_tokens(file)
     xml = generate_xml(XmlGeneratorArguments(True), [tokens], "")
-    xml.write(file.replace(".tokens", ".musicxml"))
+    ET.ElementTree(xml).write(
+        file.replace(".tokens", ".musicxml"), encoding="unicode", xml_declaration=True
+    )

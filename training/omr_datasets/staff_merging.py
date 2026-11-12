@@ -1,21 +1,26 @@
 from collections import defaultdict
 
-from homr.transformer.vocabulary import (
-    EncodedSymbol,
-    has_rhythm_symbol_a_position,
-    nonote,
-)
+from homr.transformer.vocabulary import EncodedSymbol
 
 
 class EncodedSymbolWithPos:
-    def __init__(self, position: int, symbol: EncodedSymbol, insert_before: bool = False) -> None:
+    def __init__(
+        self,
+        position: int,
+        symbol: EncodedSymbol,
+        insert_before: bool = False,
+        grace_index: int = 0,
+    ) -> None:
         self.position = position
         self.symbol = symbol
         self.rhythm = symbol.rhythm
         self.insert_before = insert_before
+        # Grace notes take no time, so several of them before the same note share a position.
+        # The index keeps them in order.
+        self.grace_index = grace_index
 
-    def sort_order(self) -> int:
-        return self.position * 2 - (1 if self.insert_before else 0)
+    def sort_order(self) -> tuple[int, int]:
+        return (self.position * 2 - (1 if self.insert_before else 0), self.grace_index)
 
     def __str__(self) -> str:
         return str(self.position) + " " + str(self.symbol)
@@ -26,15 +31,9 @@ class EncodedSymbolWithPos:
 
 def merge_upper_and_lower_staff(voices: list[list[EncodedSymbolWithPos]]) -> list[EncodedSymbol]:
     voices = [voice for voice in voices if len(voice) > 0]
-    positions: defaultdict[int, list[EncodedSymbol]] = defaultdict(list)
-    for voice_no, voice in enumerate(voices):
-        position = "upper" if voice_no == 0 else "lower"
+    positions: defaultdict[tuple[int, int], list[EncodedSymbol]] = defaultdict(list)
+    for voice in voices:
         for symbol in voice:
-            if (
-                has_rhythm_symbol_a_position(symbol.symbol.rhythm)
-                and symbol.symbol.position == nonote
-            ):
-                symbol.symbol.position = position
             positions[symbol.sort_order()].append(symbol.symbol)
 
     result: list[EncodedSymbol] = []

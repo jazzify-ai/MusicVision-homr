@@ -2,6 +2,7 @@ import argparse
 import glob
 import os
 import sys
+import xml.etree.ElementTree as ET
 from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
@@ -10,13 +11,13 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from homr import color_adjust, download_utils
+from homr import color_adjust, download_utils, jazzify
 from homr.artifacts import (
     build_geometry_artifact,
     write_geometry_json,
     write_processed_image,
 )
-from homr.autocrop import autocrop
+from homr.autocrop import autocrop_with_offset
 from homr.bar_line_detection import (
     detect_bar_lines,
     prepare_bar_line_image,
@@ -36,13 +37,23 @@ from homr.model import InputPredictions, MultiStaff
 from homr.music_xml_generator import XmlGeneratorArguments, generate_xml
 from homr.noise_filtering import filter_predictions
 from homr.note_detection import add_notes_to_staffs, combine_noteheads_with_stems
+from homr.onnx_providers import coreml_available, cuda_available, rocm_available
+from homr.pdf_utils import render_pdf_to_image
+from homr.point_mapping import PointMapping, chain, undo_crop, undo_resize
+from homr.relieur import process_concat
 from homr.resize import resize_image
 from homr.segmentation.config import segnet_path_onnx, segnet_path_onnx_fp16
 from homr.segmentation.inference_segnet import extract
 from homr.simple_logging import eprint
-from homr.staff_detection import break_wide_fragments, detect_staff, make_lines_stronger
+from homr.staff_detection import (
+    break_wide_fragments,
+    detect_staff,
+    estimate_unit_size_from_clefs,
+    make_lines_stronger,
+)
 from homr.staff_parsing import parse_staffs
 from homr.staff_position_save_load import load_staff_positions, save_staff_positions
+from homr.system_repair import repair_systems
 from homr.title_detection import detect_title, download_ocr_weights
 from homr.transformer.configs import Config, default_config
 from homr.type_definitions import NDArray
@@ -81,14 +92,14 @@ def get_predictions(
     preprocessed: NDArray,
     img_path: str,
     enable_cache: bool,
-    use_gpu_inference: bool,
+    segnet_use_gpu: bool,
 ) -> InputPredictions:
     result = extract(
         preprocessed,
         img_path,
         step_size=320,
         use_cache=enable_cache,
-        use_gpu_inference=use_gpu_inference,
+        use_gpu_inference=segnet_use_gpu,
     )
     original_image = cv2.resize(original, (result.staff.shape[1], result.staff.shape[0]))
     preprocessed_image = cv2.resize(preprocessed, (result.staff.shape[1], result.staff.shape[0]))
@@ -108,17 +119,24 @@ def replace_extension(path: str, new_extension: str) -> str:
 
 
 def load_and_preprocess_predictions(
-    image_path: str, enable_debug: bool, enable_cache: bool, use_gpu_inference: bool
-) -> tuple[InputPredictions, Debug]:
+    image_path: str, enable_debug: bool, enable_cache: bool, segnet_use_gpu: bool
+) -> tuple[InputPredictions, Debug, PointMapping]:
+    """
+    The returned mapping takes coordinates of the predictions back to the input image.
+    """
     image = cv2.imread(image_path)
     if image is None:
         raise InvalidProgramArgumentException(
             "The file format is not supported, please provide a JPG or PNG image file:" + image_path
         )
-    image = autocrop(image)
+    image, crop_top_left = autocrop_with_offset(image)
+    cropped_shape = image.shape
     image = resize_image(image)
     preprocessed = color_adjust.apply_clahe(image)
-    predictions = get_predictions(image, preprocessed, image_path, enable_cache, use_gpu_inference)
+    predictions = get_predictions(image, preprocessed, image_path, enable_cache, segnet_use_gpu)
+    to_input_image = chain(
+        undo_resize(cropped_shape, predictions.preprocessed.shape), undo_crop(*crop_top_left)
+    )
     debug = Debug(predictions.original, image_path, enable_debug)
     debug.write_image("color_adjust", preprocessed)
 
@@ -130,7 +148,7 @@ def load_and_preprocess_predictions(
     debug.write_threshold_image("stems_rest", predictions.stems_rest)
     debug.write_threshold_image("notehead", predictions.notehead)
     debug.write_threshold_image("clefs_keys", predictions.clefs_keys)
-    return predictions, debug
+    return predictions, debug, to_input_image
 
 
 def predict_symbols(debug: Debug, predictions: InputPredictions) -> PredictedSymbols:
@@ -162,7 +180,15 @@ class ProcessingConfig:
     write_staff_positions: bool
     read_staff_positions: bool
     selected_staff: int
-    use_gpu_inference: bool
+    # The transformer (encoder/decoder) only benefits from CUDA/ROCm: its fp16 "GPU"
+    # models are slower than the fp32 ones when they end up on the CPU EP, and
+    # the CoreML EP cannot run the decoder. Segnet additionally supports CoreML.
+    transformer_use_gpu: bool
+    segnet_use_gpu: bool
+    # Opt-in (--coreml-encoder): run the encoder on the Apple GPU via CoreML.
+    # Only helps across many images (slow one-time MLProgram compile).
+    coreml_encoder: bool
+    title_detection: bool
 
 
 @dataclass
@@ -172,6 +198,7 @@ class DetectionArtifacts:
     debug: Debug
     title_future: Future[str] | None
     bar_line_boxes: list[RotatedBoundingBox]
+    to_input_image: PointMapping
 
 
 def process_image(
@@ -181,7 +208,29 @@ def process_image(
     geometry_json_path: str | None = None,
     processed_image_path: str | None = None,
     geometry_only: bool = False,
-) -> None:
+    carry: dict | None = None,
+) -> str | None:
+    """Process one page. ``carry`` shares the clef/key context between pages of one document."""
+    # Jazzify: lead-sheet decoding changes, see homr/jazzify/__init__.py.
+    with jazzify.jazzify_processing(sys.modules[__name__], carry):
+        return _process_image(
+            image_path,
+            config,
+            xml_generator_args,
+            geometry_json_path=geometry_json_path,
+            processed_image_path=processed_image_path,
+            geometry_only=geometry_only,
+        )
+
+
+def _process_image(
+    image_path: str,
+    config: ProcessingConfig,
+    xml_generator_args: XmlGeneratorArguments,
+    geometry_json_path: str | None = None,
+    processed_image_path: str | None = None,
+    geometry_only: bool = False,
+) -> str | None:
     eprint("Processing " + image_path)
     xml_file = replace_extension(image_path, ".musicxml")
     debug_cleanup: Debug | None = None
@@ -191,14 +240,20 @@ def process_image(
             image = cv2.imread(image_path)
             if image is None:
                 raise ValueError("Failed to read " + image_path)
+            original_shape = image.shape
             image = resize_image(image)
+            to_input_image = undo_resize(original_shape, image.shape)
             debug = Debug(image, image_path, config.enable_debug)
             staff_position_files = replace_extension(image_path, ".txt")
             multi_staffs = load_staff_positions(
                 debug, image, staff_position_files, config.selected_staff
             )
-            title_future = Future()
-            title_future.set_result("")
+            # parse_staffs() expects a grayscale image (cv2.findContours requires it),
+            # matching what the normal detect_staffs_in_image() path hands it
+            # (predictions.preprocessed). Apply the same CLAHE preprocessing here so the
+            # two code paths feed the symbol-recognition encoder consistent input.
+            image = color_adjust.apply_clahe(image)
+            title_future = None
             bar_line_boxes: list[RotatedBoundingBox] = []
         else:
             detection = detect_staffs_in_image(
@@ -211,7 +266,9 @@ def process_image(
             debug = detection.debug
             title_future = detection.title_future
             bar_line_boxes = detection.bar_line_boxes
+            to_input_image = detection.to_input_image
         debug_cleanup = debug
+        multi_staffs = repair_systems(debug, multi_staffs)
 
         if geometry_only:
             if geometry_json_path is None and processed_image_path is None:
@@ -226,10 +283,11 @@ def process_image(
                 processed_image_path=processed_image_path,
             )
             eprint("Finished geometry detection for " + image_path)
-            return
+            return None
 
         transformer_config = Config()
-        transformer_config.use_gpu_inference = config.use_gpu_inference
+        transformer_config.use_gpu_inference = config.transformer_use_gpu
+        transformer_config.use_coreml_encoder = config.coreml_encoder
 
         result_staffs = parse_staffs(
             debug,
@@ -237,6 +295,7 @@ def process_image(
             image,
             selected_staff=config.selected_staff,
             config=transformer_config,
+            page_to_input_image=to_input_image,
         )
 
         title = title_future.result(60) if title_future is not None else ""
@@ -244,7 +303,9 @@ def process_image(
 
         eprint("Writing XML", result_staffs)
         xml = generate_xml(xml_generator_args, result_staffs, title)
-        xml.write(xml_file)
+        ET.ElementTree(xml).write(xml_file, encoding="unicode", xml_declaration=True)
+        # Jazzify: displayed accidentals (the model predicts sounding pitches only) and beams.
+        jazzify.postprocess_musicxml(xml_file)
 
         if geometry_json_path is not None or processed_image_path is not None:
             _write_geometry_artifacts(
@@ -271,6 +332,7 @@ def process_image(
     finally:
         if debug_cleanup is not None:
             debug_cleanup.clean_debug_files_from_previous_runs()
+    return xml_file
 
 
 def detect_staffs_in_image(
@@ -279,8 +341,8 @@ def detect_staffs_in_image(
     *,
     detect_title_text: bool = True,
 ) -> DetectionArtifacts:
-    predictions, debug = load_and_preprocess_predictions(
-        image_path, config.enable_debug, config.enable_cache, config.use_gpu_inference
+    predictions, debug, to_input_image = load_and_preprocess_predictions(
+        image_path, config.enable_debug, config.enable_cache, config.segnet_use_gpu
     )
     symbols = predict_symbols(debug, predictions)
 
@@ -291,12 +353,15 @@ def detect_staffs_in_image(
     noteheads_with_stems = combine_noteheads_with_stems(symbols.noteheads, symbols.stems_rest)
     debug.write_bounding_boxes_alternating_colors("notehead_with_stems", noteheads_with_stems)
     eprint("Found " + str(len(noteheads_with_stems)) + " noteheads")
-    if len(noteheads_with_stems) == 0:
-        raise Exception("No noteheads found")
-
-    average_note_head_height = float(
-        np.median([notehead.notehead.size[1] for notehead in noteheads_with_stems])
-    )
+    if len(noteheads_with_stems) > 0:
+        average_note_head_height = float(
+            np.median([notehead.notehead.size[1] for notehead in noteheads_with_stems])
+        )
+    else:
+        unit_size = estimate_unit_size_from_clefs(symbols.staff_fragments, symbols.clefs_keys)
+        if unit_size is None:
+            raise Exception("No noteheads or clefs found")
+        average_note_head_height = unit_size
     eprint("Average note head height: " + str(average_note_head_height))
 
     all_noteheads = [notehead.notehead for notehead in noteheads_with_stems]
@@ -315,11 +380,20 @@ def detect_staffs_in_image(
         "anchor_input", symbols.staff_fragments + bar_line_boxes + symbols.clefs_keys
     )
     staffs = detect_staff(
-        debug, predictions.staff, symbols.staff_fragments, symbols.clefs_keys, bar_line_boxes
+        debug,
+        predictions.staff,
+        symbols.staff_fragments,
+        symbols.clefs_keys,
+        bar_line_boxes,
+        predictions.symbols,
     )
     if len(staffs) == 0:
         raise Exception("No staffs found")
-    title_future = detect_title(debug, staffs[0]) if detect_title_text else None
+    if config.title_detection and detect_title_text:
+        title_future: Future[str] | None = detect_title(debug, staffs[0])
+    else:
+        title_future = None
+
     debug.write_bounding_boxes_alternating_colors("staffs", staffs)
 
     brace_dot_img = prepare_brace_dot_image(predictions.symbols, predictions.staff)
@@ -346,6 +420,7 @@ def detect_staffs_in_image(
         debug=debug,
         title_future=title_future,
         bar_line_boxes=bar_line_boxes,
+        to_input_image=to_input_image,
     )
 
 
@@ -376,8 +451,10 @@ def _write_geometry_artifacts(
 
 def get_all_image_files_in_folder(folder: str) -> list[str]:
     image_files = []
-    for ext in ["png", "jpg", "jpeg", "PNG", "JPG", "JPEG"]:
+    for ext in ["png", "jpg", "jpeg", "pdf", "PNG", "JPG", "JPEG", "PDF"]:
         image_files.extend(glob.glob(os.path.join(folder, "**", f"*.{ext}"), recursive=True))
+    # On case-insensitive file systems the upper and lower case patterns match the same files
+    image_files = list(dict.fromkeys(image_files))
     without_teasers = [
         img
         for img in image_files
@@ -389,22 +466,23 @@ def get_all_image_files_in_folder(folder: str) -> list[str]:
     return sorted(without_teasers)
 
 
-def download_weights(use_gpu_inference: bool) -> None:
+def download_weights(segnet_use_gpu: bool, transformer_use_gpu: bool, coreml_encoder: bool) -> None:
     base_url = "https://github.com/liebharc/homr/releases/download/onnx_checkpoints/"
-    if use_gpu_inference:
-        models = [
-            segnet_path_onnx_fp16,
-            default_config.filepaths.encoder_path_fp16,
-            default_config.filepaths.decoder_path_fp16,
-        ]
-        missing_models = [model for model in models if not os.path.exists(model)]
+    models = [segnet_path_onnx_fp16 if segnet_use_gpu else segnet_path_onnx]
+    if transformer_use_gpu:
+        # CUDA runs the whole transformer on the fp16 models.
+        models.append(default_config.filepaths.encoder_path_fp16)
+        models.append(default_config.filepaths.decoder_path_fp16)
     else:
-        models = [
-            segnet_path_onnx,
-            default_config.filepaths.encoder_path,
-            default_config.filepaths.decoder_path,
-        ]
-        missing_models = [model for model in models if not os.path.exists(model)]
+        # On the CPU EP the fp32 models are faster, and the CoreML EP cannot run
+        # the decoder, so the decoder always uses fp32. The CoreML encoder, when
+        # enabled, uses the fp16 encoder instead of the fp32 one.
+        if coreml_encoder:
+            models.append(default_config.filepaths.encoder_path_fp16)
+        else:
+            models.append(default_config.filepaths.encoder_path)
+        models.append(default_config.filepaths.decoder_path)
+    missing_models = [model for model in models if not os.path.exists(model)]
 
     if len(missing_models) == 0:
         return
@@ -427,11 +505,43 @@ def download_weights(use_gpu_inference: bool) -> None:
                     os.remove(downloaded_zip)
 
 
+def run_homr(
+    images: list, config: ProcessingConfig, xml_generator_args: XmlGeneratorArguments
+) -> None:
+    """
+    Runs homr on all images in a list and merges them into musicxml using relieur
+    """
+    eprint("Merging", len(images), "files:", images)
+    xml_paths = []
+    carry: dict = {}  # Jazzify: clef/key context carried from page to page
+    for image_file in images:
+        eprint("=========================================")
+        try:
+            xml_path = process_image(image_file, config, xml_generator_args, carry=carry)
+            if xml_path is not None:
+                xml_paths.append(xml_path)
+            eprint("Finished", image_file)
+        except Exception as e:
+            eprint(f"An error occurred while processing {image_file}: {e}")
+            raise
+
+    if len(xml_paths) == len(images) and len(xml_paths) > 1:
+        m, _, _ = process_concat(xml_paths)
+        for path in xml_paths:
+            if os.path.exists(path):
+                os.remove(path)
+        filename = os.path.splitext(images[0])[0]
+        output_path = f"{filename}.musicxml"
+        ET.ElementTree(m).write(output_path, encoding="UTF-8", xml_declaration=True)
+
+        eprint(f"Saved the generated musicxml at {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="homer", description="An optical music recognition (OMR) system"
     )
-    parser.add_argument("image", type=str, nargs="?", help="Path to the image to process")
+    parser.add_argument("image", type=str, nargs="*", help="Path to the image to process")
     parser.add_argument(
         "--init",
         action="store_true",
@@ -493,18 +603,39 @@ def main() -> None:
         default=GpuSupport.AUTO,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--coreml-encoder",
+        action="store_true",
+        help="On Apple Silicon, run the transformer encoder on the GPU via "
+        + "CoreML. Compiling the model takes 26-60 s at startup, so this only "
+        + "pays off when processing many images. Has no effect with CUDA.",
+    )
+    parser.add_argument(
+        "--no-title", action="store_true", help="Don't detect title for faster inference"
+    )
 
     args = parser.parse_args()
 
-    has_gpu_support = "CUDAExecutionProvider" in ort.get_available_providers()
+    force_gpu = args.gpu == GpuSupport.FORCE
+    auto_gpu = args.gpu == GpuSupport.AUTO
 
-    use_gpu_inference = (
-        args.gpu == GpuSupport.AUTO and has_gpu_support
-    ) or args.gpu == GpuSupport.FORCE
+    # CUDA/ROCm speeds up the whole pipeline. CoreML only helps segnet: the fp16
+    # models the GPU path uses are slower on the CPU EP than the fp32 ones,
+    # and the CoreML EP cannot run the decoder (see Segnet for details).
+    transformer_use_gpu = force_gpu or (auto_gpu and (cuda_available() or rocm_available()))
+    segnet_use_gpu = force_gpu or (
+        auto_gpu and (cuda_available() or rocm_available() or coreml_available())
+    )
+    # The CoreML encoder is a separate opt-in and only applies when the
+    # transformer isn't already on CUDA/ROCm.
+    coreml_encoder = args.coreml_encoder and not transformer_use_gpu and coreml_available()
 
-    download_weights(use_gpu_inference)
-    if args.init:
+    download_weights(segnet_use_gpu, transformer_use_gpu, coreml_encoder)
+
+    if not args.no_title:
         download_ocr_weights()
+
+    if args.init:
         eprint("Init finished")
         return
 
@@ -514,7 +645,10 @@ def main() -> None:
         args.write_staff_positions,
         args.read_staff_positions,
         -1,
-        use_gpu_inference,
+        transformer_use_gpu,
+        segnet_use_gpu,
+        coreml_encoder,
+        not args.no_title,
     )
 
     xml_generator_args = XmlGeneratorArguments(
@@ -530,10 +664,16 @@ def main() -> None:
         eprint("No image provided")
         parser.print_help()
         sys.exit(1)
-    elif os.path.isfile(args.image):
+
+    # Jazzify: geometry artifacts are written for exactly one image file.
+    if args.geometry_json or args.processed_image or args.geometry_only:
+        image = args.image[0]
+        if len(args.image) != 1 or not os.path.isfile(image) or image.lower().endswith(".pdf"):
+            eprint("--geometry-json, --processed-image and --geometry-only need one image file")
+            sys.exit(2)
         try:
             process_image(
-                args.image,
+                image,
                 config,
                 xml_generator_args,
                 geometry_json_path=args.geometry_json,
@@ -543,30 +683,51 @@ def main() -> None:
         except InvalidProgramArgumentException as e:
             eprint(str(e))
             sys.exit(2)
-    elif os.path.isdir(args.image):
-        image_files = get_all_image_files_in_folder(args.image)
-        eprint("Processing", len(image_files), "files:", image_files)
-        error_files = []
-        for image_file in image_files:
-            eprint("=========================================")
-            try:
-                process_image(
-                    image_file,
-                    config,
-                    xml_generator_args,
-                    geometry_json_path=args.geometry_json,
-                    processed_image_path=args.processed_image,
-                    geometry_only=args.geometry_only,
-                )
-                eprint("Finished", image_file)
-            except Exception as e:
-                eprint(f"An error occurred while processing {image_file}: {e}")
-                error_files.append(image_file)
-        if len(error_files) > 0:
-            eprint("Errors occurred while processing the following files:", error_files)
-    else:
-        eprint(f"{args.image} is not a valid file or directory")
-        sys.exit(2)
+        return
+
+    images_to_combine = []
+    for image in args.image:
+        if os.path.isfile(image):
+            # Multiple files are getting merged
+            if image.lower().endswith(".pdf"):
+                images_to_combine += render_pdf_to_image(image)
+            else:
+                images_to_combine.append(image)
+
+        elif os.path.isdir(image):
+            # Directories are never merged
+            image_files = get_all_image_files_in_folder(image)
+            eprint("Processing", len(image_files), "files:", image_files)
+            error_files = []
+            for image_file in image_files:
+                eprint("=========================================")
+                try:
+                    if image_file.lower().endswith(".pdf"):
+                        rendered_images = render_pdf_to_image(image_file)
+                        run_homr(rendered_images, config, xml_generator_args)
+                    else:
+                        process_image(image_file, config, xml_generator_args)
+                    eprint("Finished", image_file)
+                except Exception as e:
+                    eprint(f"An error occurred while processing {image_file}: {e}")
+                    error_files.append(image_file)
+            if len(error_files) > 0:
+                eprint("Errors occurred while processing the following files:", error_files)
+
+        else:
+            eprint(f"{image} is not a valid file or directory")
+            sys.exit(2)
+
+    # Check if we have any images
+    if images_to_combine:
+        # After collectiong all images we run homr on them
+        try:
+            run_homr(images_to_combine, config, xml_generator_args)
+        except InvalidProgramArgumentException as e:
+            eprint(str(e))
+            sys.exit(2)
+        except Exception:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

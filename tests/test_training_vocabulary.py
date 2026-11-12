@@ -1,7 +1,10 @@
 import unittest
 
-from homr.transformer.vocabulary import EncodedSymbol
+from homr.transformer.vocabulary import EncodedSymbol, Vocabulary
 from training.transformer.training_vocabulary import (
+    CLEF_ANCHORS,
+    max_ledger_lines,
+    read_token_lines,
     token_lines_to_str,
 )
 
@@ -14,20 +17,66 @@ repeatEnd . . . ."""
 
 
 class TestTrainingVocabulary(unittest.TestCase):
+    def test_slurs_stay_in_their_voice(self) -> None:
+        for main, secondary in (("upper", "upper2"), ("lower", "lower2")):
+            for high_voice, low_voice in ((main, secondary), (secondary, main)):
+                with self.subTest(high_voice=high_voice, low_voice=low_voice):
+                    line = (
+                        f"note_4 B4 _ _ slurStop {high_voice}&"
+                        f"note_4. E4 _ _ slurStart {low_voice}"
+                    )
+                    self.assertEqual(token_lines_to_str(read_token_lines([line])), line)
+
+    def test_slurs_merge_on_highest_note_of_same_voice(self) -> None:
+        for voice in ("upper", "upper2", "lower", "lower2"):
+            with self.subTest(voice=voice):
+                line = (
+                    f"note_4 E4 _ _ slurStart {voice}&"
+                    f"note_4 G4 _ _ slurStop {voice}&"
+                    f"note_4 C4 _ _ slurStart {voice}"
+                )
+                expected = (
+                    f"note_4 G4 _ _ slurStart_slurStop {voice}&"
+                    f"note_4 E4 _ _ _ {voice}&note_4 C4 _ _ _ {voice}"
+                )
+                self.assertEqual(token_lines_to_str(read_token_lines([line])), expected)
+
     def test_sort_token_chords(self) -> None:
         chord = [
             EncodedSymbol("note_8", "C4", articulation="staccatissimo", position="upper"),
             EncodedSymbol("chord"),
             EncodedSymbol("note_8", "E5", position="lower"),
             EncodedSymbol("chord"),
-            EncodedSymbol("note_16", "E4", articulation="tieStart_tenuto", position="upper"),
+            EncodedSymbol(
+                "note_16", "E4", articulation="tenuto", slur="slurStart", position="upper"
+            ),
             EncodedSymbol("chord"),
-            EncodedSymbol("note_32", "D4", articulation="tieStart_slurStop", position="upper"),
+            EncodedSymbol("note_32", "D4", slur="slurStart_slurStop", position="upper"),
         ]
         result = token_lines_to_str(chord)
         self.maxDiff = None
         expected = (
-            "note_16 E4 . slurStop_staccatissimo_tenuto_tieStart upper&note_32 D4 . _ upper"
-            "&note_8 C4 . _ upper&note_8 E5 . . lower"
+            "note_16 E4 . staccatissimo_tenuto slurStart_slurStop upper&note_32 D4 . _ _ upper"
+            "&note_8 C4 . _ _ upper&note_8 E5 . . . lower"
         )
         self.assertEqual(result, expected)
+
+    def test_clef_anchor_coverage(self) -> None:
+        # Clefs that don't represent pitch by vertical staff position (e.g. tablature)
+        # have no meaningful diatonic anchor and are intentionally excluded from
+        # CLEF_ANCHORS. Any other new clef must be added to CLEF_ANCHORS.
+        non_pitched_clefs = {"clef_TAB5"}
+
+        vocabulary = Vocabulary()
+        clef_tokens = {token for token in vocabulary.rhythm if token.startswith("clef_")}
+        self.assertEqual(clef_tokens - non_pitched_clefs, set(CLEF_ANCHORS.keys()))
+
+    def test_max_ledger_lines(self) -> None:
+        tokens = [
+            EncodedSymbol("note_4", "C6", ".", "_", "upper"),
+            EncodedSymbol("note_4", "C4", ".", "_", "lower"),
+        ]
+
+        # Upper anchor is clef_G2 (B4) and lower anchor is clef_F4 (D3).
+        # C6 is 2 ledger lines above the treble staff and C4 is 1 ledger line above the bass staff.
+        self.assertEqual(max_ledger_lines(tokens), 2)

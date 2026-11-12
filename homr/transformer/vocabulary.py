@@ -10,6 +10,39 @@ from homr.simple_logging import eprint
 nonote = "."
 empty = "_"  # used for decorations on note, if there is no decoration
 
+VALID_TIME_SIGNATURE_DENOMINATORS = [1, 2, 3, 4, 6, 8, 12, 16, 32, 48]
+DYNAMICS = [
+    "pppp",
+    "ppp",
+    "pp",
+    "p",
+    "mp",
+    "mf",
+    "f",
+    "ff",
+    "fff",
+    "sfz",
+    "sffz",
+    "fp",
+    "sf",
+    "fz",
+    "rf",
+    "rfz",
+    "sfp",
+    "empty",
+]
+DYNAMICS_MODIFIER = [
+    "piu",
+    "dolce",
+    "poco",
+    "espress",
+    "subito",
+    "atempo",
+    "leggiero",
+    "pocopiu",
+    "sempre",
+]
+
 
 def build_dict(tokens: Iterable[str]) -> dict[str, int]:
     result = {}
@@ -44,10 +77,11 @@ def build_rhythm() -> dict[str, int]:
     rhythm.extend([f"clef_F{c}" for c in range(3, 6)])
     rhythm.extend([f"clef_C{c}" for c in range(1, 6)])
     rhythm.extend([f"clef_G{c}" for c in range(1, 3)])
+    rhythm.append("clef_TAB5")
 
     # signatures
     rhythm.extend([f"keySignature_{c}" for c in range(-7, 8)])
-    rhythm.extend([f"timeSignature/{c}" for c in [1, 2, 3, 4, 6, 8, 12, 16, 32, 48]])
+    rhythm.extend([f"timeSignature/{c}" for c in VALID_TIME_SIGNATURE_DENOMINATORS])
 
     # rhythm, kern durations are based on https://www.humdrum.org/rep/kern/
     rhythm.extend([f"rest_{c}m" for c in range(2, 11)])  # multirests
@@ -66,21 +100,8 @@ def build_rhythm() -> dict[str, int]:
     rhythm.extend([f"rest_{d}" for d in kern_values])
     rhythm.extend([f"rest_{d}" for d in irregular_durations])
 
-    # Note relations (https://en.wikipedia.org/wiki/List_of_musical_symbols)
-    rhythm.extend(["tieSlur"])  #  "gliss"
-
     # Dynamics
-    # rhythm.extend(
-    #    [f"dynamic_{d}" for d in ["ppp", "pp", "p", "mp", "mf", "f", "ff", "fff", "sfz", "fp"]]
-    # )
-    # rhythm.extend(
-    #    [
-    #        "crescendoStart",
-    #        "crescendoEnd",
-    #        "diminuendoStart",
-    #        "diminuendoEnd",
-    #    ]
-    # )
+    rhythm.extend([f"dynamic_{d}" for d in DYNAMICS])
 
     return build_dict(rhythm)
 
@@ -94,8 +115,40 @@ def build_position() -> dict[str, int]:
     """
     The staff position, applies to notes, rests and clefs
     """
-    positions = [nonote, "upper", "lower"]
+    positions = [nonote, "upper", "upper2", "lower", "lower2"]
     return build_dict(positions)
+
+
+def is_lower_position(position: str) -> bool:
+    return position.startswith("lower")
+
+
+def is_upper_or_has_no_position(position: str) -> bool:
+    return not is_lower_position(position)
+
+
+def _split_articulations(articulation: str) -> list[str]:
+    """Split combined articulations while keeping dynamic modifiers intact.
+
+    Dynamic modifiers use the ``dynamic_`` prefix as part of their vocabulary
+    token (for example ``dynamic_dolce``), so that underscore is not a
+    separator.
+    """
+    parts = [part for part in articulation.split("_") if part]
+    result: list[str] = []
+    index = 0
+    while index < len(parts):
+        if (
+            parts[index] == "dynamic"
+            and index + 1 < len(parts)
+            and parts[index + 1] in DYNAMICS_MODIFIER
+        ):
+            result.append(f"dynamic_{parts[index + 1]}")
+            index += 2
+        else:
+            result.append(parts[index])
+            index += 1
+    return result
 
 
 def build_articulation() -> dict[str, int]:
@@ -105,152 +158,95 @@ def build_articulation() -> dict[str, int]:
     # so we use it to define this list
     articulations_lieder = [
         "accent",
+        "accent_accentStrong",
         "accent_arpeggiate",
         "accent_arpeggiate_fermata",
-        "accent_arpeggiate_slurStart",
-        "accent_arpeggiate_slurStart_staccato",
-        "accent_arpeggiate_slurStop",
-        "accent_arpeggiate_slurStop_staccato",
         "accent_arpeggiate_staccato",
+        "accent_arpeggiate_tenuto",
         "accent_breathMark",
         "accent_breathMark_fermata",
-        "accent_breathMark_slurStart",
-        "accent_breathMark_slurStop",
         "accent_fermata",
-        "accent_fermata_slurStart",
-        "accent_fermata_slurStart_trill",
-        "accent_fermata_slurStop",
-        "accent_slurStart",
-        "accent_slurStart_slurStop",
-        "accent_slurStart_slurStop_tenuto",
-        "accent_slurStart_slurStop_trill",
-        "accent_slurStart_staccato",
-        "accent_slurStart_tenuto",
-        "accent_slurStart_tieStart",
-        "accent_slurStart_tieStop",
-        "accent_slurStart_tremolo",
-        "accent_slurStart_trill",
-        "accent_slurStop",
-        "accent_slurStop_staccato",
-        "accent_slurStop_tenuto",
-        "accent_slurStop_tieStart",
-        "accent_slurStop_tremolo",
-        "accent_slurStop_trill",
+        "accent_fermata_tremolo",
         "accent_staccatissimo",
         "accent_staccato",
         "accent_staccato_tenuto",
+        "accent_staccato_tremolo",
+        "accent_staccato_trill",
         "accent_tenuto",
-        "accent_tieStart",
-        "accent_tieStart_trill",
-        "accent_tieStop",
         "accent_tremolo",
         "accent_trill",
+        "accentStrong",
+        "accentStrong_arpeggiate",
+        "accentStrong_arpeggiate_fermata",
+        "accentStrong_arpeggiate_staccato",
+        "accentStrong_arpeggiate_tenuto",
+        "accentStrong_breathMark",
+        "accentStrong_breathMark_fermata",
+        "accentStrong_fermata",
+        "accentStrong_fermata_tremolo",
+        "accentStrong_staccatissimo",
+        "accentStrong_staccato",
+        "accentStrong_staccato_tenuto",
+        "accentStrong_staccato_tremolo",
+        "accentStrong_staccato_trill",
+        "accentStrong_tenuto",
+        "accentStrong_tremolo",
+        "accentStrong_trill",
         "arpeggiate",
+        "arpeggiate_breathMark",
         "arpeggiate_fermata",
-        "arpeggiate_fermata_slurStart",
-        "arpeggiate_fermata_slurStop",
-        "arpeggiate_slurStart",
-        "arpeggiate_slurStart_slurStop",
-        "arpeggiate_slurStart_staccatissimo",
-        "arpeggiate_slurStart_staccato",
-        "arpeggiate_slurStart_staccato_tenuto",
-        "arpeggiate_slurStart_tenuto",
-        "arpeggiate_slurStart_tremolo",
-        "arpeggiate_slurStop",
-        "arpeggiate_slurStop_staccatissimo",
-        "arpeggiate_slurStop_staccato",
-        "arpeggiate_slurStop_tenuto",
+        "arpeggiate_fermata_staccato",
+        "arpeggiate_fermata_tenuto",
         "arpeggiate_staccatissimo",
+        "arpeggiate_staccatissimo_staccato",
         "arpeggiate_staccato",
+        "arpeggiate_staccato_tenuto",
         "arpeggiate_tenuto",
         "arpeggiate_tremolo",
         "arpeggiate_trill",
         "breathMark",
         "breathMark_fermata",
-        "breathMark_fermata_slurStop",
         "breathMark_fermata_tenuto",
-        "breathMark_slurStart",
-        "breathMark_slurStart_trill",
-        "breathMark_slurStop",
-        "breathMark_slurStop_staccato",
-        "breathMark_slurStop_trill",
         "breathMark_staccato",
-        "breathMark_staccato_tenuto",
         "breathMark_tenuto",
         "breathMark_tremolo",
+        "breathMark_trill",
         "fermata",
-        "fermata_slurStart",
-        "fermata_slurStart_slurStop",
-        "fermata_slurStart_trill",
-        "fermata_slurStop",
-        "fermata_slurStop_staccato",
-        "fermata_slurStop_tenuto",
-        "fermata_slurStop_tremolo",
-        "fermata_slurStop_trill",
-        "fermata_slurStop_turn",
         "fermata_staccato",
         "fermata_tenuto",
-        "fermata_tieStart_tieStop",
-        "fermata_tieStop",
         "fermata_tremolo",
         "fermata_trill",
-        "slurStart",
-        "slurStart_slurStop",
-        "slurStart_slurStop_staccato",
-        "slurStart_slurStop_staccato_tenuto",
-        "slurStart_slurStop_tenuto",
-        "slurStart_slurStop_tieStart_tieStop",
-        "slurStart_slurStop_tremolo",
-        "slurStart_slurStop_trill",
-        "slurStart_slurStop_turn",
-        "slurStart_staccatissimo",
-        "slurStart_staccato",
-        "slurStart_staccato_tenuto",
-        "slurStart_staccato_tieStop",
-        "slurStart_tenuto",
-        "slurStart_tenuto_tieStart",
-        "slurStart_tenuto_trill",
-        "slurStart_tieStart",
-        "slurStart_tieStart_tieStop",
-        "slurStart_tieStop",
-        "slurStart_tieStop_trill",
-        "slurStart_tremolo",
-        "slurStart_trill",
-        "slurStart_turn",
-        "slurStop",
-        "slurStop_staccatissimo",
-        "slurStop_staccato",
-        "slurStop_staccato_tenuto",
-        "slurStop_tenuto",
-        "slurStop_tieStart",
-        "slurStop_tieStart_tieStop",
-        "slurStop_tieStop",
-        "slurStop_tremolo",
-        "slurStop_trill",
-        "slurStop_turn",
+        "fermata_turn",
+        "mordent",
         "staccatissimo",
+        "staccatissimo_staccato",
+        "staccatissimo_staccato_tenuto",
+        "staccatissimo_staccato_tenuto_trill",
+        "staccatissimo_tenuto",
         "staccato",
         "staccato_tenuto",
-        "staccato_tieStart",
-        "staccato_tieStop",
         "staccato_tremolo",
         "staccato_trill",
         "staccato_turn",
         "tenuto",
-        "tieStart",
-        "tieStart_tieStop",
-        "tieStart_tieStop_trill",
-        "tieStart_trill",
-        "tieStop",
-        "tieStop_trill",
+        "tenuto_tremolo",
+        "tenuto_trill",
         "tremolo",
         "trill",
+        "trill_turn",
         "turn",
     ]
 
     articulation.extend(articulations_lieder)
+    articulation.extend([f"dynamic_{d}" for d in DYNAMICS_MODIFIER])
 
     return build_dict(articulation)
+
+
+def build_slur() -> dict[str, int]:
+    slur = [nonote, empty]
+    slur.extend(["slurStart_slurStop", "slurStart", "slurStop"])
+    return build_dict(slur)
 
 
 def build_pitch() -> dict[str, int]:
@@ -262,7 +258,7 @@ def build_pitch() -> dict[str, int]:
 
 
 def has_rhythm_symbol_a_position(rhythm: str) -> bool:
-    return rhythm.startswith(("note", "rest", "clef"))
+    return rhythm.startswith(("note", "rest", "clef", "dynamic"))
 
 
 class Vocabulary:
@@ -271,6 +267,7 @@ class Vocabulary:
         self.lift = build_lift()
         self.articulation = build_articulation()
         self.pitch = build_pitch()
+        self.slur = build_slur()
         self.position = build_position()
 
 
@@ -319,7 +316,7 @@ def kern_to_symbol_duration(kern: str) -> SymbolDuration:
     """
     if kern.endswith("m"):
         # Multirest
-        SymbolDuration(Fraction(1), 0, 1, 1, 4)
+        return SymbolDuration(Fraction(1), 0, 1, 1, 4)
 
     # Extract numeric prefix (can be > 1 digit)
     i = 0
@@ -362,6 +359,7 @@ class EncodedSymbol:
         pitch: str = nonote,
         lift: str = nonote,
         articulation: str = nonote,
+        slur: str = nonote,
         position: str = nonote,
         coordinates: tuple[float, float] | None = None,
     ) -> None:
@@ -369,6 +367,7 @@ class EncodedSymbol:
         self.pitch = pitch
         self.lift = lift
         self.articulation = articulation
+        self.slur = slur
         self.position = position
 
         # These coordinates are derived from transformer attention and are inherently imprecise,
@@ -377,6 +376,8 @@ class EncodedSymbol:
         # this ordering can be used to reject cases where attention-based coordinates
         # violate monotonic scan constraints and are therefore unreliable.
         self.coordinates = coordinates
+        # The coordinates mapped back to the image which was given to homr as input
+        self.image_coordinates: tuple[float, float] | None = None
         self._duration: SymbolDuration | None = None
 
     def is_control_symbol(self) -> bool:
@@ -411,33 +412,44 @@ class EncodedSymbol:
         return result
 
     def to_upper_position(self) -> "EncodedSymbol":
-        if self.position != "lower":
+        if is_upper_or_has_no_position(self.position):
             return self
         result = copy.copy(self)
-        result.position = "upper"
+        result.position = self.position.replace("lower", "upper")
         return result
 
     def is_valid(self) -> bool:
         has_position = has_rhythm_symbol_a_position(self.rhythm)
-        is_note = [s != nonote for s in [self.lift, self.articulation, self.pitch, self.position]]
+        is_note = [
+            s != nonote
+            for s in [self.lift, self.articulation, self.pitch, self.slur, self.position]
+        ]
         return all(item == has_position for item in is_note)
 
     def add_articulations(self, articulations: list[str]) -> "EncodedSymbol":
         all_articulations = []
         all_articulations.extend(articulations)
-        all_articulations.extend([a for a in self.articulation.split("_") if a])
+        all_articulations.extend(_split_articulations(self.articulation))
         result = copy.copy(self)
         result.articulation = str.join("_", sorted(all_articulations))
+        return result
+
+    def add_slurs(self, slurs: list[str]) -> "EncodedSymbol":
+        all_slurs = []
+        all_slurs.extend(slurs)
+        all_slurs.extend([a for a in self.slur.split("_") if a])
+        result = copy.copy(self)
+        result.slur = str.join("_", sorted(all_slurs))
         return result
 
     def strip_articulations(
         self, to_be_removed: list[str], remove_all: bool = False
     ) -> tuple[list[str], "EncodedSymbol"]:
+        if self.articulation == nonote and not has_rhythm_symbol_a_position(self.rhythm):
+            return [], copy.copy(self)
         stripped = []
         remaining = []
-        for articulation in self.articulation.split("_"):
-            if not articulation:
-                continue
+        for articulation in _split_articulations(self.articulation):
             if remove_all or articulation in to_be_removed:
                 stripped.append(articulation)
             else:
@@ -447,6 +459,28 @@ class EncodedSymbol:
             result.articulation = str.join("_", remaining)
         else:
             result.articulation = empty
+
+        return stripped, result
+
+    def strip_slurs(
+        self, to_be_removed: list[str], remove_all: bool = False
+    ) -> tuple[list[str], "EncodedSymbol"]:
+        if self.slur == nonote and not has_rhythm_symbol_a_position(self.rhythm):
+            return [], copy.copy(self)
+        stripped = []
+        remaining = []
+        for slur in self.slur.split("_"):
+            if not slur:
+                continue
+            if remove_all or slur in to_be_removed:
+                stripped.append(slur)
+            else:
+                remaining.append(slur)
+        result = copy.copy(self)
+        if remaining:
+            result.slur = str.join("_", remaining)
+        else:
+            result.slur = empty
 
         return stripped, result
 
@@ -468,7 +502,9 @@ class EncodedSymbol:
         return duration
 
     def __str__(self) -> str:
-        return str.join(" ", (self.rhythm, self.pitch, self.lift, self.articulation, self.position))
+        return str.join(
+            " ", (self.rhythm, self.pitch, self.lift, self.articulation, self.slur, self.position)
+        )
 
     def __repr__(self) -> str:
         return str(self)
@@ -480,13 +516,16 @@ class EncodedSymbol:
                 and self.pitch == __value.pitch
                 and self.lift == __value.lift
                 and self.articulation == __value.articulation
+                and self.slur == __value.slur
                 and self.position == __value.position
             )
         else:
             return False
 
     def __hash__(self) -> int:
-        return hash((self.rhythm, self.pitch, self.lift, self.articulation, self.position))
+        return hash(
+            (self.rhythm, self.pitch, self.lift, self.articulation, self.slur, self.position)
+        )
 
     def __lt__(self, other: object) -> bool:
         if not isinstance(other, EncodedSymbol):
@@ -506,7 +545,7 @@ def _remove_redudant_clefs_keys_and_time_signatures(
         result = []
         for symbol in chord:
             if symbol.rhythm.startswith("clef"):
-                if symbol.position == "upper":
+                if is_upper_or_has_no_position(symbol.position):
                     if symbol.rhythm != clef_upper:
                         clef_upper = symbol.rhythm
                         result.append(symbol)
@@ -616,17 +655,16 @@ def _remove_tuplets(measure: list[list[EncodedSymbol]]) -> list[list[EncodedSymb
 
 def _fix_over_eager_tuplets(chords: list[list[EncodedSymbol]]) -> list[list[EncodedSymbol]]:
     """
-    Repair a short measure only when unscaling its tuplets exactly restores
-    the typical measure duration. A short pickup alone is not sufficient evidence.
+    The transformer tends to add too many tuplets, so we remove them
+    based on the length of a measurement.
     """
     measures = _group_into_measures(chords)
     mean = _get_typical_duration_of_measures(measures)
     result = []
     for i, measure in enumerate(measures):
-        unscaled = _remove_tuplets(measure)
-        if _get_duration_of_measure(measure) < mean and _get_duration_of_measure(unscaled) == mean:
+        if _get_duration_of_measure(measure) < mean:
             eprint("Removing tuplets from measure #", i + 1)
-            result.append(unscaled)
+            result.append(_remove_tuplets(measure))
         else:
             result.append(measure)
     return _flatten_measures(result)
@@ -635,14 +673,25 @@ def _fix_over_eager_tuplets(chords: list[list[EncodedSymbol]]) -> list[list[Enco
 def _only_keep_lower_staff_if_there_is_a_clef(
     chords: list[list[EncodedSymbol]],
 ) -> list[list[EncodedSymbol]]:
+    """
+    Decided per staff line, as a voice can join single staffs and grand staffs.
+    """
     has_lower_clef = False
+    line_start = 0
     all_results = []
     for i, chord in enumerate(chords):
+        if any(symbol.rhythm == "newline" for symbol in chord):
+            has_lower_clef = False
+            line_start = i + 1
         result = []
         for symbol in chord:
             if has_lower_clef:
                 result.append(symbol)
-            elif i < 5 and symbol.rhythm.startswith("clef") and symbol.position == "lower":
+            elif (
+                i - line_start < 5  # noqa: PLR2004
+                and symbol.rhythm.startswith("clef")
+                and is_lower_position(symbol.position)
+            ):
                 has_lower_clef = True
                 result.append(symbol)
             else:
@@ -696,14 +745,15 @@ if __name__ == "__main__":
     eprint("Lift=", json.dumps(vocab.lift, indent=2))
     eprint("Articulation=", json.dumps(vocab.articulation, indent=2))
     eprint("Pitch=", json.dumps(vocab.pitch, indent=2))
+    eprint("Slurs=", json.dumps(vocab.slur, indent=2))
     eprint("Positions=", json.dumps(vocab.position, indent=2))
 
     valid_combinations = []
 
-    for r, li, a, p, pos in itertools.product(
-        vocab.rhythm, vocab.lift, vocab.articulation, vocab.pitch, vocab.position
+    for r, li, a, p, sl, pos in itertools.product(
+        vocab.rhythm, vocab.lift, vocab.articulation, vocab.pitch, vocab.slur, vocab.position
     ):
-        symbol = EncodedSymbol(r, li, a, p, pos)
+        symbol = EncodedSymbol(r, li, a, p, sl, pos)
         is_valid = symbol.is_valid()
         if not is_valid:
             continue

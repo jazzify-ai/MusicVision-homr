@@ -52,6 +52,16 @@ For details on past experiments, see [Training](Training.md) and the Git history
 
 The staff detection module (`staff_detection.py`) has proven robust in real-world scenarios, accurately identifying staffs in most cases. It can also determine how a staff is warped or curved, allowing this information to be used later for dewarping.
 
+### Inference Time
+
+While homr's inference time is low enough, further improvements could be made:
+- Static int8 quantization for the Segnet
+- Static KV cache for the Decoder
+- Add batch support to the Transformer
+- Using modern frameworks like Onnx-GenAI
+
+All of these are rather complicated and might not provide major speedups.
+
 ### Support More Symbols
 
 Expanding **homr**'s support for additional musical symbols requires building high-quality training data first. Once datasets are improved (see above), adding new symbols becomes tractable.
@@ -79,7 +89,7 @@ To add new symbols, you should first understand the [TrOMR architecture as descr
 | Symbol                                  | Status                             | How to Improve                                                                        |
 | --------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------- |
 | Staffs                                  | ✓                                  | -                                                                                     |
-| Clefs                                   | ✓                                  | -                                                                                     |
+| Clefs                                   | ✓, except octave clefs             | Add clef tokens with an octave change (e.g. treble with 8 below for tenor voices); today the notes come out an octave off |
 | Key Signatures                          | ✓                                  | -                                                                                     |
 | Time Signatures                         | ✓                                  | -                                                                                     |
 | Bars                                    | ✓                                  | -                                                                                     |
@@ -90,11 +100,13 @@ To add new symbols, you should first understand the [TrOMR architecture as descr
 | Dotted notes                            | ✓                                  | -                                                                                     |
 | Tuplets                                 | ✓                                  | -                                                                                     |
 | Rests                                   | ✓, multirests with max 10 measures | Consider alternative encoding to handle larger values without bloating the vocabulary |
-| Slurs / Ties                            | ✗ (detected but ignored)           | Quality of detection needs improvement before output can be reliable                  |
+| Slurs / Ties                            | ✓                                  |
+-                                                                                     |
 | Articulation, Fermata                   | ✓                                  | -                                                                                     |
 | Repeats, codas, da capo, volta brackets | ✓                                  | -                                                                                     |
 | Glissando                               | ✗                                  | Add `glis_start`, `glis_end` to articulation vocabulary                               |
 | Ornaments (trill, turns)                | ✓                                  | -                                                                                     |
+| Beams                                   | ✗                                  | Not in the vocabulary. Could be derived from the rhythm in the MusicXML writer, or added to the vocabulary |
 
 ### MusicXML Generation
 

@@ -3,30 +3,45 @@
 This split is the AGPL-covered HOMR component for Jazzify/MusicVision. It can
 run as a standalone HTTP service and exposes source information at `/source`.
 
-homr is an Optical Music Recognition (OMR) software designed to transform camera pictures of sheet music into
+homr is an Optical Music Recognition (OMR) software designed to transform camera pictures or PDFs of sheet music into
 machine-readable MusicXML format. The resulting [MusicXML](https://www.w3.org/2021/06/musicxml40/) files can be further
 processed using tools such as [musescore](https://musescore.com/).
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/liebharc/homr/blob/main/colab.ipynb)
+For a quick try, visit our online demo at [homr.site](https://homr.site) or [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/liebharc/homr/blob/main/colab.ipynb)
 
 You might also want to check out [Andromr](https://github.com/aicelen/Andromr), an Android app for optical music recognition using homr.
 
 ## Prerequisites
 
-- Python 3.11
-- Poetry
-- Optional: NVidia GPU with CUDA 12.1
+- Python 3.11 or 3.12
+- Poetry or UV
+- Optional
+  - NVIDIA GPU with CUDA 12.1
+  - AMD GPU with ROCm 7.0
 
-## Getting started
+## Getting started (uv)
+
+The easiest way to get started is using `uvx` (`uv` must be installed). Select an inference backend:
+- CPU: `uvx --from 'homr[cpu]' homr <image>`
+- NVIDIA CUDA: `uvx --from 'homr[cuda]' homr <image>`
+- AMD ROCm: `uvx --python 3.12 --from 'homr[rocm]' homr <image>`
+
+- The resulting MusicXML file will be saved in the same directory as the input image
+
+## Getting started (poetry)
 
 - Clone the repository
 - Install dependencies for:
-  - GPU (requires CUDA): `poetry install --only main,gpu`
-  - CPU: `poetry install --only main`
-  - Development: `poetry install`
+  - Inference: `poetry install --only main --extras cpu`
+  - Development: `poetry install --extras cpu`
+  - If using GPU, replace `--extras cpu` to `--extras cuda` / `--extras rocm`
 - Run the program using `poetry run homr <image>`
 - The resulting MusicXML file will be saved in the same directory as the input image
-- To combine the MusicXML results from multiple images, you can use [relieur](https://github.com/papoteur-mga/relieur)
+
+## Run on multiple images
+- Just add your image to the command, for example: `poetry run homr <image_1> <image_2>`
+- This produces one file named `merged_image_1.musicxml`
+- To combine MusicXML files, you can use [relieur](https://github.com/papoteur-mga/relieur)
 
 ## HOMR HTTP service
 
@@ -79,10 +94,13 @@ in the output, the overall structure remains accurate.
 The homr result is obtained by processing the [homr output](figures/tabi.musicxml) and rendering it
 with [musescore](https://musescore.com/).
 
+## Preprocessing
+
+Depending on the input, preprocessing the image can improve the results. A common step is to remove the background from scanned images.
+
 ## Limitations
 
-The current implementation focuses on pitch and rhythm information on the bass or treble clef, neglecting dynamics,
-articulation, double sharps/flats, and other musical symbols.
+See the symbol table in [Ideas for Contributors](IDEAS_FOR_CONTRIBUTORS.md#support-more-symbols) for what homr reads and what it doesn't, e.g. octave lines, octave clefs, beams and glissandos.
 
 ## Technical Details
 
@@ -127,11 +145,19 @@ Each staff is dewarped (perspective-corrected) and passed through a transformer-
 
 The transformer model generates these predictions in sequence, processing the dewarped staff image to understand the spatial and temporal relationships between musical symbols.
 
-**Note**: The transformer output provides the sequence of symbols but does not include explicit positional information (horizontal or vertical coordinates). However, the model computes the center of attention as a byproduct of the attention mechanism, which can be used to estimate the focus point on the staff image.
+**Note**: The transformer output provides the sequence of symbols but does not include explicit positional information (horizontal or vertical coordinates). However, the model computes the center of attention as a byproduct of the attention mechanism, which is used to estimate the focus point on the staff image. homr maps this point back to the input image and writes it as a comment into each note of the MusicXML output, e.g. `<!-- imgpos: 45, 231 -->`. These are rough positions: they point at or near the symbol, but aren't pixel-exact.
 
 ### Stage 4: MusicXML Output
 
 The symbol sequence is converted into MusicXML format and saved to disk. The resulting file can be processed with tools like [musescore](https://musescore.com/) or [relieur](https://github.com/papoteur-mga/relieur) (for multi-image combinations).
+
+## Related Projects
+
+- [AEU-OMR](https://github.com/mtalhabalci/aeu-omr): an OMR model for printed Turkish makam music notation, based on homr.
+
+## License
+
+homr is licensed under AGPL-3.0. For commercial use and the licenses of the training data behind the model weights, see [LICENSE_FAQ.md](LICENSE_FAQ.md).
 
 ## Citation
 

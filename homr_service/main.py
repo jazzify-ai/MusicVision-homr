@@ -56,7 +56,8 @@ class ArtifactManifest(BaseModel):
 def preload_models() -> None:
     if os.getenv("HOMR_PRELOAD_MODELS", "true").strip().lower() not in {"1", "true", "yes"}:
         return
-    download_weights(_use_gpu_inference())
+    use_gpu = _use_gpu_inference()
+    download_weights(segnet_use_gpu=use_gpu, transformer_use_gpu=use_gpu, coreml_encoder=False)
     download_ocr_weights()
 
 
@@ -163,7 +164,10 @@ def _run_homr(*, input_path: Path, output_dir: Path, geometry_only: bool) -> Non
         write_staff_positions=False,
         read_staff_positions=False,
         selected_staff=-1,
-        use_gpu_inference=_use_gpu_inference(),
+        transformer_use_gpu=_use_gpu_inference(),
+        segnet_use_gpu=_use_gpu_inference(),
+        coreml_encoder=False,
+        title_detection=True,
     )
     xml_generator_args = XmlGeneratorArguments(False, None, None)
     process_image(

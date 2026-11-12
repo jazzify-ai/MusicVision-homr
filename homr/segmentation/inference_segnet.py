@@ -8,6 +8,13 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+from homr.onnx_providers import (
+    coreml_available,
+    coreml_mlprogram_providers,
+    cuda_available,
+    gpu_providers,
+    rocm_available,
+)
 from homr.segmentation.config import (
     segmentation_version,
     segnet_path_onnx,
@@ -20,23 +27,56 @@ from homr.type_definitions import NDArray
 class Segnet:
     def __init__(self, use_gpu_inference: bool) -> None:
         self.use_gpu = False
-        if use_gpu_inference:
+        if use_gpu_inference and (cuda_available() or rocm_available()):
             try:
                 # I had this issue: https://github.com/microsoft/onnxruntime/issues/21684
-                # If torch is installed, this fixes "libcudnn.so.9: cannot open shared object file"
-                ort.preload_dlls()
-                self.model = ort.InferenceSession(
-                    segnet_path_onnx_fp16, providers=["CUDAExecutionProvider"]
-                )
+                # If torch is installed, this fixes
+                # "libcudnn.so.9: cannot open shared object file"
+                if cuda_available():
+                    ort.preload_dlls()
+                providers, _ = gpu_providers()
+                self.model = ort.InferenceSession(segnet_path_onnx_fp16, providers=providers)
                 self.fp16 = True
+                # Segnet always binds its output on the CPU, so use_gpu only needs to track
+                # that a GPU provider is active (used for logging/diagnostics).
                 self.use_gpu = True
             except Exception as e:
                 eprint(
-                    "Error while trying to load model using CUDA. You probably don't have a compatible gpu"  # noqa: E501
+                    "Error while trying to load model on the GPU. You probably don't have a compatible gpu"  # noqa: E501
                 )
                 eprint(e)
                 self.model = ort.InferenceSession(segnet_path_onnx_fp16)
                 self.fp16 = True
+        elif use_gpu_inference and coreml_available():
+            try:
+                # CPUAndGPU skips the (slow, CPU-bound) ANE specialization that
+                # "ALL" performs at session creation and on the first inference.
+                # Steady-state batches are slightly slower than with "ALL", but
+                # a session only lives for one image, so the warmup dominates
+                # (measured on an M1: ~1.9 s vs ~2.6 s for a 4-staff page).
+                self.model = ort.InferenceSession(
+                    segnet_path_onnx_fp16,
+                    providers=coreml_mlprogram_providers(
+                        segnet_path_onnx_fp16, compute_units="CPUAndGPU"
+                    ),
+                )
+                self.fp16 = True
+                self.use_gpu = True
+            except Exception as e:
+                eprint("Error while trying to load model on CoreML, falling back to the CPU")
+                eprint(e)
+                if os.path.exists(segnet_path_onnx):
+                    self.model = ort.InferenceSession(segnet_path_onnx)
+                    self.fp16 = False
+                else:
+                    self.model = ort.InferenceSession(segnet_path_onnx_fp16)
+                    self.fp16 = True
+        elif use_gpu_inference:
+            # --gpu force without a GPU execution provider: only the fp16 model
+            # has been downloaded, run it on the CPU.
+            eprint("No GPU execution provider available, running on the CPU instead")
+            self.model = ort.InferenceSession(segnet_path_onnx_fp16)
+            self.fp16 = True
         else:
             self.model = ort.InferenceSession(segnet_path_onnx)
             self.fp16 = False
@@ -77,6 +117,9 @@ class ExtractResult:
         self.stems_rests = stems_rests
         self.notehead = notehead
         self.clefs_keys = clefs_keys
+
+
+_segnet_inference: Segnet | None = None
 
 
 def extract_patch(image: NDArray, y: int, x: int, win_size: int) -> NDArray:
@@ -152,7 +195,9 @@ def inference(
     if step_size < 0:
         step_size = win_size // 2
 
-    model = Segnet(use_gpu_inference)
+    global _segnet_inference  # noqa: PLW0603
+    if _segnet_inference is None:
+        _segnet_inference = Segnet(use_gpu_inference)
 
     image_org = cv2.cvtColor(image_org, cv2.COLOR_GRAY2BGR)
     image = np.transpose(image_org, (2, 0, 1)).astype(np.float32)
@@ -171,13 +216,13 @@ def inference(
             batch.append(hop)
 
             if len(batch) == batch_size:
-                batch_out = model.run(np.stack(batch, axis=0))
+                batch_out = _segnet_inference.run(np.stack(batch, axis=0))
                 for out in batch_out:
                     data.append(np.argmax(out, axis=0))
                 batch.clear()
 
     if batch:
-        batch_out = model.run(np.stack(batch, axis=0))
+        batch_out = _segnet_inference.run(np.stack(batch, axis=0))
         for out in batch_out:
             data.append(np.argmax(out, axis=0))
 
@@ -212,23 +257,27 @@ def extract(
     if npy_path.exists() and use_cache:
         eprint("Found a cache")
         file_hash = hashlib.sha256(original_image).hexdigest()  # type: ignore
-        with lzma.open(npy_path, "rb") as f:
-            staff = np.load(f)
-            notehead = np.load(f)
-            symbols = np.load(f)
-            stems_rests = np.load(f)
-            clefs_keys = np.load(f)
-            cached_file_hash = f.readline().decode().strip()
-            model_name = f.readline().decode().strip()
-            if cached_file_hash == "" or model_name == "":
-                eprint("Cache is missing meta information, skipping cache")
-            elif file_hash != cached_file_hash:
-                eprint("File hash mismatch, skipping cache")
-            elif model_name != segmentation_version:
-                eprint("Models have been updated, skipping cache")
-            else:
-                loaded_from_cache = True
-                eprint("Loading from cache")
+        try:
+            with lzma.open(npy_path, "rb") as f:
+                staff = np.load(f)
+                notehead = np.load(f)
+                symbols = np.load(f)
+                stems_rests = np.load(f)
+                clefs_keys = np.load(f)
+                cached_file_hash = f.readline().decode().strip()
+                model_name = f.readline().decode().strip()
+        except (EOFError, lzma.LZMAError, ValueError):
+            # E.g. written by an interrupted run
+            cached_file_hash = model_name = ""
+        if cached_file_hash == "" or model_name == "":
+            eprint("Cache is missing meta information, skipping cache")
+        elif file_hash != cached_file_hash:
+            eprint("File hash mismatch, skipping cache")
+        elif model_name != segmentation_version:
+            eprint("Models have been updated, skipping cache")
+        else:
+            loaded_from_cache = True
+            eprint("Loading from cache")
 
     if not loaded_from_cache:
         staff, symbols, stems_rests, notehead, clefs_keys = inference(

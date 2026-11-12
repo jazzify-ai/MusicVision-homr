@@ -9,7 +9,9 @@ Before you begin, make sure you have a GitHub account and have familiarized your
 ### Issues
 
 - Before submitting a new issue, please search existing issues to avoid duplicates.
-- When creating an issue, provide as much relevant information as possible to help us understand the problem or feature request.
+- Please attach a real image: a scan or photo of actual sheet music. Synthetic or AI generated images show problems that don't occur in practice, so we can't work with them.
+- Please keep it short. `homr` is a volunteer project and we read every word. A few sentences and the image tell us more than a long analysis. If an AI helps you write, trim its output to the essentials.
+- Issues are for problems, pull requests are for solutions. If you have a fix, open a pull request: before, together with or without an issue is all fine.
 
 ### Pull Requests
 
@@ -38,11 +40,14 @@ Before you begin, make sure you have a GitHub account and have familiarized your
 - Update the README.md or documentation if your changes require it.
 - Add comments to your code where necessary to explain complex or non-obvious parts of your implementation.
 
+### AI usage
+Please explain how you used AI. For example to what extent you verified the AI's output.
+
 ### Detection Algorithm Changes
 
 If your contribution impacts the detection algorithm, please include examples that showcase the enhancements. 
 This should cover both qualitative examples and, where possible, quantitative metrics to illustrate the improvements. 
-Utilize the [rate_validation_result.py](https://github.com/liebharc/homr/blob/main/validation/rate_validation_result.py) script to generate metrics across multiple images, 
+Utilize the [rate_validation_result.py](https://github.com/liebharc/homr/blob/main/validation/rate_validation_result.py) script or our benchmark (for more details see [Benchmark.md](https://github.com/liebharc/homr/blob/main/Benchmark.md)) to generate metrics across multiple images, 
 provided you have access to corresponding groundtruth MusicXML files.
 
 ### Training Model Updates

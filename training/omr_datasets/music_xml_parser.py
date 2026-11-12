@@ -1,0 +1,1048 @@
+"""Convert MusicXML scores into musical symbols for training and evaluation.
+
+music_xml_string_to_tokens() and music_xml_file_to_tokens() return a list of
+parts, each containing a list of Measure objects. A part usually represents
+one instrument or singing role and may contain multiple staves. Each Measure
+contains an ordered list of EncodedSymbol objects and a page-break flag.
+
+TokensMeasure collects symbols and their positions while reading one measure,
+then orders them across staves and supplies its ending barline when needed.
+Even a measure with no emitted symbols retains its ending barline. TokensPart
+collects the finished measures and carries state between them, such as duration
+units and clef changes queued for the next measure.
+
+Repeat signs stay in their source measures during parsing. Callers use
+normalize_barlines_and_repeats() after selecting the measures for one training
+image or a complete part for comparison. It combines signs at shared measure
+boundaries, then returns a flat list of symbols.
+"""
+
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from typing import Iterable, Sequence, SupportsIndex, TypeVar, overload
+
+from homr.music_xml_generator import DURATION_NAMES
+from homr.simple_logging import eprint
+from homr.transformer.vocabulary import (
+    DYNAMICS,
+    DYNAMICS_MODIFIER,
+    VALID_TIME_SIGNATURE_DENOMINATORS,
+    EncodedSymbol,
+    empty,
+    has_rhythm_symbol_a_position,
+    is_lower_position,
+)
+from training.omr_datasets.staff_merging import (
+    EncodedSymbolWithPos,
+    merge_upper_and_lower_staff,
+)
+from training.transformer.training_vocabulary import VocabularyStats, check_token_lines
+
+_T = TypeVar("_T")
+
+
+def _children(el: ET.Element, tag: str) -> list[ET.Element]:
+    return el.findall(tag)
+
+
+def _child(el: ET.Element, tag: str) -> ET.Element | None:
+    return el.find(tag)
+
+
+def _text(el: ET.Element | None, default: str = "") -> str:
+    if el is None or el.text is None:
+        return default
+    return el.text.strip()
+
+
+def _int_text(el: ET.Element | None, default: int = 0) -> int:
+    t = _text(el)
+    if t == "":
+        return default
+    return int(t)
+
+
+class Measure(list[EncodedSymbol]):
+    """A list-like container that stores EncodedSymbol objects."""
+
+    def __init__(self, iterable: Iterable[EncodedSymbol] = ()) -> None:
+        """Initialize Measure from an iterable of EncodedSymbol objects."""
+        super().__init__(iterable)
+        self.new_page = False
+
+    @overload
+    def __setitem__(self, index: SupportsIndex, item: EncodedSymbol, /) -> None: ...
+
+    @overload
+    def __setitem__(self, index: slice, item: Iterable[EncodedSymbol], /) -> None: ...
+
+    def __setitem__(
+        self, index: SupportsIndex | slice, item: EncodedSymbol | Iterable[EncodedSymbol], /
+    ) -> None:
+        """Set item(s) at index."""
+        if isinstance(index, slice):
+            # Type narrowing: if index is slice, item must be Iterable
+            super().__setitem__(index, list(item) if not isinstance(item, list) else item)  # type: ignore[arg-type]
+        else:
+            # Type narrowing: if index is not slice, item is EncodedSymbol
+            super().__setitem__(index, item)  # type: ignore
+
+    @overload
+    def __add__(self, other: list[EncodedSymbol], /) -> "Measure": ...
+
+    @overload
+    def __add__(self, other: list[_T], /) -> list[EncodedSymbol | _T]: ...
+
+    def __add__(self, other: list, /) -> "Measure | list":
+        """Return a new Measure combining this one with another list."""
+        result = Measure(self)
+        result.extend(other)
+        return result
+
+    def __mul__(self, other: SupportsIndex, /) -> "Measure":
+        """Return a new Measure with items repeated."""
+        return Measure(super().__mul__(other))
+
+    __rmul__ = __mul__
+
+    def __repr__(self) -> str:
+        """Return a string representation of the Measure."""
+        return f"Measure({list(self)!r})"
+
+    def copy(self) -> "Measure":
+        """Return a shallow copy of the Measure."""
+        return Measure(self)
+
+
+DURATION_NUMBER = {v: k for k, v in DURATION_NAMES.items()}
+
+ARTIC_MAPPING: dict[str, str] = {
+    "strongAccent": "accentStrong",
+    "softAccent": "accent",
+    "invertedTurn": "turn",
+    "trillMark": "trill",
+    # trill and vibrato according to https://www.w3.org/2021/06/musicxml40/musicxml-reference/elements/wavy-line/
+    "wavyLine": "trill",
+    "invertedMordent": "trill",
+    "accidentalMark": "",  # ignore this value
+    "scoop": "",
+    "doit": "",
+    "caesura": "",
+    "otherOrnament": "",
+    "otherArticulation": "",
+}
+
+# Tags inside <articulations> that we don't otherwise special-case.
+_ARTICULATIONS_TAG = "articulations"
+_ORNAMENTS_TAG = "ornaments"
+
+
+def _xml_name_to_camel(tag: str) -> str:
+    """Convert a hyphenated MusicXML tag (e.g. 'strong-accent') to camelCase
+    (e.g. 'strongAccent'), matching what the old musicxml package's class
+    names produced after stripping the XML prefix."""
+    parts = tag.split("-")
+    if len(parts) == 1:
+        return parts[0]
+    return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:] if p)
+
+
+class TokensMeasure:
+    """
+    MusicXML allows directions such as forward/backwards. For training we need
+    to have a well defined sequence. So we linearize the MusicXML instrunctions
+    using this class.
+    """
+
+    def __init__(self) -> None:
+        self.symbols: list[EncodedSymbolWithPos] = []
+        self.main_voice: dict[int, int] = {}  # map staff id to its main voice id
+        self.graces_at: dict[tuple[int, int], int] = {}  # (staff, position) -> grace notes so far
+        self.current_position = 0
+        # Start and grace index of the last note, chord members start with it
+        self.last_note_start = 0
+        self.last_grace_index = 0
+        self.new_page = False
+
+    def append_symbol(self, symbol: EncodedSymbol) -> None:
+        if symbol.rhythm.startswith("note"):
+            raise ValueError("Call append_note for notes")
+        else:
+            self.current_position += 1
+            offset = 1 if "barline" in symbol.rhythm else 0
+            self.symbols.append(EncodedSymbolWithPos(self.current_position + offset, symbol, True))
+
+    def mark_new_page(self) -> None:
+        self.new_page = True
+
+    def append_symbol_to_staff(self, staff: int, symbol: EncodedSymbol) -> None:
+        if has_rhythm_symbol_a_position(symbol.rhythm):
+            symbol.position = self._get_staff_position(staff)
+        if symbol.rhythm.startswith("note"):
+            raise ValueError("Call append_note for notes")
+        else:
+            self.symbols.append(EncodedSymbolWithPos(self.current_position, symbol, True))
+
+    def append_position_change(self, duration: int) -> None:
+        new_position = self.current_position + duration
+        if new_position < 0:
+            raise ValueError(
+                "Backup duration is too long " + str(self.current_position) + " " + str(duration)
+            )
+        self.current_position = new_position
+
+    def append_rest(
+        self,
+        staff: int,
+        voice: int,
+        is_chord: bool,
+        duration: int,
+        invisible: bool,
+        symbol: EncodedSymbol,
+    ) -> None:
+        self.append_note(staff, voice, is_chord, duration, invisible, symbol)
+
+    def append_note(
+        self,
+        staff: int,
+        voice: int,
+        is_chord: bool,
+        duration: int,
+        invisible: bool,
+        symbol: EncodedSymbol,
+    ) -> None:
+        is_grace = "G" in symbol.rhythm
+        symbol.position = self._get_staff_position(staff)
+        if not invisible:
+            if voice != self.main_voice[staff]:
+                symbol.position += "2"
+        if is_chord:
+            # The chord's first note can be invisible, so it isn't always the last symbol
+            if not invisible:
+                self.symbols.append(
+                    EncodedSymbolWithPos(
+                        self.last_note_start,
+                        symbol,
+                        insert_before=is_grace,
+                        grace_index=self.last_grace_index,
+                    )
+                )
+            self.current_position = self.last_note_start + duration
+        else:
+            grace_index = 0
+            if is_grace:
+                key = (staff, self.current_position)
+                grace_index = self.graces_at.get(key, 0)
+                self.graces_at[key] = grace_index + 1
+            self.last_note_start = self.current_position
+            self.last_grace_index = grace_index
+            if not invisible:
+                self.symbols.append(
+                    EncodedSymbolWithPos(
+                        self.current_position,
+                        symbol,
+                        insert_before=is_grace,
+                        grace_index=grace_index,
+                    )
+                )
+            self.current_position += duration
+
+    def _get_staff_no(self, symbol: EncodedSymbolWithPos) -> int:
+        if is_lower_position(symbol.symbol.position):
+            return 1
+        return 0
+
+    def _get_staff_position(self, staff: int) -> str:
+        if staff == 0:
+            return "upper"
+        return "lower"
+
+    def _fill_in_arpeggiate(self, symbols_with_pos: list[EncodedSymbolWithPos]) -> None:
+        """
+        In the Lieder dataset we find that an arpeggiate always is rendered
+        as it would affect all notes in a chord, even if the MusicXML doesn't
+        reflect that.
+        """
+        arpegiatted_positions: set[tuple[tuple[int, int], str]] = set()
+        for entry in symbols_with_pos:
+            # `pos` is the place in the measure (grace notes come before the chord at the same
+            # position), `sym.position` is the upper/lower staff.
+            pos, sym = entry.sort_order(), entry.symbol
+            if "arpeggiate" in sym.articulation:
+                arpegiatted_positions.add((pos, sym.position))
+
+        for entry in symbols_with_pos:
+            pos, sym = entry.sort_order(), entry.symbol
+            if (
+                (pos, sym.position) in arpegiatted_positions
+                and "arpeggiate" not in sym.articulation
+                and sym.rhythm.startswith(("note", "rest"))
+                and not sym.rhythm.startswith("note_0")
+                and not sym.rhythm.startswith("rest_0")
+            ):
+                art = sym.articulation
+                art_parts = []
+                if art != empty:
+                    art_parts = art.split("_")
+                art_parts.append("arpeggiate")
+                art = str.join("_", sorted(art_parts))
+                sym.articulation = art
+
+    def complete_measure(self) -> Measure:  # noqa: C901
+        """Build a Measure from the collected symbols.
+
+        Order the symbols, combine the staff sequences, and add an ordinary
+        ending barline when needed. Preserve the page-break flag.
+        Empty source measures produce a single barline.
+        """
+        self._fill_in_arpeggiate(self.symbols)
+        result_staff: list[list[EncodedSymbolWithPos]] = [[], []]
+        grouped_symbols: dict[tuple[int, int], list[EncodedSymbolWithPos]] = {}
+        for symbol in self.symbols:
+            sort_order = symbol.sort_order()
+            if sort_order not in grouped_symbols:
+                grouped_symbols[sort_order] = []
+            grouped_symbols[sort_order].append(symbol)
+        for sort_order in sorted(grouped_symbols.keys()):
+            group = grouped_symbols[sort_order]
+            group_pos: list[EncodedSymbolWithPos] = []
+            for symbol in group:
+                if symbol.insert_before:
+                    result_staff[self._get_staff_no(symbol)].append(symbol)
+                elif symbol.symbol.rhythm.endswith("G"):
+                    # Grace notes come before a group
+                    result_staff[self._get_staff_no(symbol)].append(symbol)
+                else:
+                    group_pos.append(symbol)
+            for symbol_in_group in group_pos:
+                result_staff[self._get_staff_no(symbol_in_group)].append(symbol_in_group)
+
+        # Staff merging supplies ending barlines for nonempty symbol lists,
+        # but treats any repeat as an ending. An empty measure still needs an
+        # ending barline when it has no symbols or only an opening repeat.
+        merged_symbols = merge_upper_and_lower_staff(result_staff)
+        if not merged_symbols or merged_symbols[-1].rhythm == "repeatStart":
+            merged_symbols.append(EncodedSymbol("barline"))
+        result_measure = Measure(merged_symbols)
+        result_measure.new_page = self.new_page
+        return result_measure
+
+
+class TupletState:
+    """
+    Counts the open tuplets, as tuplets of different voices can overlap. Counting
+    rather than tracking voices keeps it independent of how voices are numbered.
+    """
+
+    def __init__(self) -> None:
+        self.open_tuplets = 0
+        self.last_stop_position = -1
+
+    def get_tuplet_factor(self, note: ET.Element, position: int) -> float:
+        # A tuplet counts whether or not its number is printed: many editions only print the
+        # "3" on the first groups. Notes with a <time-modification> outside of a <tuplet>
+        # (e.g. a two-note tremolo) keep their written length.
+        in_tuplet = self.open_tuplets > 0 or self.last_stop_position == position
+        notations = _children(note, "notations")
+        if len(notations) > 0:
+            for t in _children(notations[0], "tuplet"):
+                t_type = t.get("type", None)
+                if t_type == "start":
+                    self.open_tuplets += 1
+                    in_tuplet = True
+                if t_type == "stop":
+                    self.open_tuplets = max(self.open_tuplets - 1, 0)
+                    self.last_stop_position = position
+
+        if not in_tuplet:
+            return 1.0
+        time_modification = _children(note, "time-modification")
+        if len(time_modification) == 0:
+            return 1.0
+        actual_notes = _children(time_modification[0], "actual-notes")
+        if len(actual_notes) == 0:
+            return 1.0
+        normal_notes = _children(time_modification[0], "normal-notes")
+        if len(normal_notes) == 0:
+            return 1.0
+        actual = _int_text(actual_notes[0])
+        normal = _int_text(normal_notes[0])
+        return float(actual) / float(normal)
+
+    def on_end_of_measure(self) -> None:
+        self.open_tuplets = 0
+        self.last_stop_position = -1
+
+
+def _measure_rest_rhythm(duration: int, divisions: int) -> str:
+    if divisions <= 0:
+        return "rest_1"
+    quarters = duration / divisions
+    lookup = [
+        (4.0, "rest_1"),
+        (3.0, "rest_2."),
+        (2.0, "rest_2"),
+        (1.5, "rest_4."),
+        (1.0, "rest_4"),
+        (0.75, "rest_8."),
+        (0.5, "rest_8"),
+    ]
+    for q, token in lookup:
+        if abs(quarters - q) < 0.01:
+            return token
+    return "rest_1"
+
+
+class TokensPart:
+    def __init__(self, allow_octave_shifts: bool = False) -> None:
+        # Octave shifts and octave clefs are rejected for training. The benchmarks
+        # allow them: MusicXML pitches are sounding pitches, so they can be ignored.
+        self.allow_octave_shifts = allow_octave_shifts
+        self.current_measure: TokensMeasure | None = None
+        self.measures: list[Measure] = []
+        self.tuplets = TupletState()
+        self.tremolo = False
+        self.divisions: int = 1
+        # Clefs queued by an after-barline declaration in the previous measure,
+        # not yet eligible to be flushed into the current one.
+        self.queued_clefs: dict[int, EncodedSymbol] = {}
+        # Queued clefs that became active once the measure they target started;
+        # still cancellable by an explicit clef in that same measure.
+        self.pending_clefs: dict[int, EncodedSymbol] = {}
+
+    def _ensure_current_measure(self) -> TokensMeasure:
+        """
+        MusicXML may split a measure's attributes across several <attributes>
+        elements, e.g. one with only divisions/time followed by one with the
+        clef. So the clef isn't guaranteed to be the very first symbol.
+        """
+        if self.current_measure is None:
+            self.current_measure = TokensMeasure()
+        return self.current_measure
+
+    def _flush_pending_clefs(self) -> None:
+        if not self.pending_clefs:
+            return
+        current_measure = self._ensure_current_measure()
+        for staff, symbol in self.pending_clefs.items():
+            current_measure.append_symbol_to_staff(staff, symbol)
+        self.pending_clefs = {}
+
+    def append_clefs(self, clefs: list[tuple[EncodedSymbol, int]]) -> None:
+        resolved = [
+            (clef[1] if clef[1] >= 0 else index, clef[0]) for index, clef in enumerate(clefs)
+        ]
+        # An explicit clef for a staff in this measure overrides any clef
+        # that was queued for it via after-barline in the previous measure.
+        for staff, _ in resolved:
+            self.pending_clefs.pop(staff, None)
+        self._flush_pending_clefs()
+        current_measure = self._ensure_current_measure()
+        for staff, symbol in resolved:
+            current_measure.append_symbol_to_staff(staff, symbol)
+
+    def append_dynamic(self, dynamic: EncodedSymbol, staff: int) -> None:
+        self._flush_pending_clefs()
+        current_measure = self._ensure_current_measure()
+        dynamic.position = current_measure._get_staff_position(staff)
+        current_measure.append_symbol_to_staff(staff, dynamic)
+
+    def queue_clefs_for_next_measure(self, clefs: list[tuple[EncodedSymbol, int]]) -> None:
+        """
+        A <clef after-barline="yes"> is printed at the end of the current
+        measure but only takes effect at the start of the next one.
+        """
+        for index, clef in enumerate(clefs):
+            staff = clef[1] if clef[1] >= 0 else index
+            self.queued_clefs[staff] = clef[0]
+
+    def append_symbol(self, symbol: EncodedSymbol) -> None:
+        self._flush_pending_clefs()
+        self._ensure_current_measure().append_symbol(symbol)
+
+    def mark_new_page(self) -> None:
+        self._flush_pending_clefs()
+        self._ensure_current_measure().mark_new_page()
+
+    def append_rest(
+        self,
+        staff: int,
+        voice: int,
+        is_chord: bool,
+        duration: int,
+        invisible: bool,
+        symbol: EncodedSymbol,
+    ) -> None:
+        self._flush_pending_clefs()
+        self._ensure_current_measure().append_rest(
+            staff, voice, is_chord, duration, invisible, symbol
+        )
+
+    def append_note(
+        self,
+        staff: int,
+        voice: int,
+        is_chord: bool,
+        duration: int,
+        invisible: bool,
+        symbol: EncodedSymbol,
+    ) -> None:
+        self._flush_pending_clefs()
+        self._ensure_current_measure().append_note(
+            staff, voice, is_chord, duration, invisible, symbol
+        )
+
+    def append_position_change(self, duration: int) -> None:
+        self._flush_pending_clefs()
+        self._ensure_current_measure().append_position_change(duration)
+
+    def set_main_voices(self, main_voices: dict[int, int]) -> None:
+        self._ensure_current_measure().main_voice = main_voices
+
+    def on_end_of_measure(self) -> None:
+        self.measures.append(self._ensure_current_measure().complete_measure())
+        self.current_measure = TokensMeasure()
+        self.pending_clefs.update(self.queued_clefs)
+        self.queued_clefs = {}
+        self.tuplets.on_end_of_measure()
+
+    def get_measures(self) -> list[Measure]:
+        return self.measures
+
+    def _get_current_position(self) -> int:
+        if self.current_measure is None:
+            return 0
+        return self.current_measure.current_position
+
+    def get_tuplet_factor(self, note: ET.Element, is_chord: bool, duration: int) -> float:
+        position = self._get_current_position()
+        if is_chord:
+            position -= duration
+        return self.tuplets.get_tuplet_factor(note, position)
+
+
+def _lift_from_pitch_or_accidental(pitch: ET.Element, note: ET.Element) -> str:
+    # explicit courtesy accidental overrides calculated
+    accs = _children(note, "accidental")
+    if accs:
+        v = _text(accs[0])
+        return {"sharp": "#", "flat": "b", "natural": "N"}.get(v, empty)
+    alter = _child(pitch, "alter")
+    if alter is None:
+        return empty
+    val = int(float(_text(alter, "0")))
+    return _alter_to_lifts(val)
+
+
+def _count_dots(note: ET.Element) -> int:
+    dots = _children(note, "dot")
+    return len(dots)
+
+
+def _process_attributes(part: TokensPart, attribute: ET.Element) -> int:
+    divs = _children(attribute, "divisions")
+    if len(divs) > 0:
+        part.divisions = _int_text(divs[0], 1) or 1
+    clefs = _children(attribute, "clef")
+    if len(clefs) > 0:
+        clefs_tokens: list[tuple[EncodedSymbol, int]] = []
+        deferred_clefs_tokens: list[tuple[EncodedSymbol, int]] = []
+        for clef in clefs:
+            sign = _text(_child(clef, "sign"))
+            line = _text(_child(clef, "line"))
+            has_octave_change = _child(clef, "clef-octave-change") is not None
+            if has_octave_change and not part.allow_octave_shifts:
+                raise ValueError("Octave change isn't supported")
+            clef_number = int(clef.get("number", "1")) - 1
+            token = (EncodedSymbol(f"clef_{sign}{line}", empty, empty, empty, empty), clef_number)
+            if clef.get("after-barline") == "yes":
+                deferred_clefs_tokens.append(token)
+            else:
+                clefs_tokens.append(token)
+        if clefs_tokens:
+            part.append_clefs(clefs_tokens)
+        if deferred_clefs_tokens:
+            part.queue_clefs_for_next_measure(deferred_clefs_tokens)
+    keys = _children(attribute, "key")
+    times = _children(attribute, "time")
+    if len(keys) > 0:
+        fifths = _text(_child(keys[0], "fifths"), "0")
+        part.append_symbol(EncodedSymbol(f"keySignature_{int(fifths)}"))
+    if len(times) > 0:
+        beat_type = _text(_child(times[0], "beat-type"))
+        if not beat_type.isdigit() or int(beat_type) not in VALID_TIME_SIGNATURE_DENOMINATORS:
+            raise ValueError(f"Unsupported time signature denominator: {beat_type}")
+        part.append_symbol(EncodedSymbol(f"timeSignature/{beat_type}"))
+
+    multiple_rest_duration = 0
+    style = _children(attribute, "measure-style")
+    if len(style) > 0:
+        multiple_rest_duration = _process_multi_rests(part, style[0])
+    return multiple_rest_duration
+
+
+def _alter_to_lifts(alter: int) -> str:
+    if alter < -1:
+        return "bb"
+    if alter == -1:
+        return "b"
+    if alter == 1:
+        return "#"
+    if alter > 1:
+        return "##"
+    return "N"
+
+
+def _pitch_name(pitch: ET.Element) -> str:
+    step = _text(_child(pitch, "step"))
+    octave = _text(_child(pitch, "octave"))
+    return f"{step}{octave}"
+
+
+def _rhythm_token(base: str, number: int, dots: int, is_grace: bool) -> str:
+    dot_str = "." * min(dots, 2)
+    grace = "G" if is_grace else ""
+    return f"{base}_{number}{grace}{dot_str}"
+
+
+def _collect_articulation(note: ET.Element, part: TokensPart, staff: int) -> tuple[str, str]:
+    notations_list = _children(note, "notations")
+    if not notations_list:
+        return empty, empty
+    notations = notations_list[0]
+    if notations.get("print-object", None) == "no":
+        return empty, empty
+    articulations = []
+    slurs = []
+    # pick the first articulation we support if multiple present
+    for child in list(notations):
+        print_object = child.get("print-object", None)
+        invisible = print_object == "no"
+        if child.tag == _ARTICULATIONS_TAG and not invisible:
+            for a in list(child):
+                a_tag = _xml_name_to_camel(a.tag)
+                if a.tag == "tremolo" and not invisible:
+                    tremolo_type = str(a.get("type", ""))
+                    part.tremolo = tremolo_type == "start"
+                else:
+                    name = a_tag[0].lower() + a_tag[1:]
+                    if name in ARTIC_MAPPING:
+                        if ARTIC_MAPPING[name]:
+                            articulations.append(ARTIC_MAPPING[name])
+                    else:
+                        articulations.append(name)
+        if child.tag == "fermata" and not invisible:
+            articulations.append("fermata")
+        if child.tag == _ORNAMENTS_TAG and not invisible:
+            for o in list(child):
+                o_tag = _xml_name_to_camel(o.tag)
+                nm = o_tag[0].lower() + o_tag[1:]
+                if nm in ARTIC_MAPPING:
+                    if ARTIC_MAPPING[nm]:
+                        articulations.append(ARTIC_MAPPING[nm])
+                else:
+                    articulations.append(nm)
+        if child.tag == "tuplet":
+            # Tuplets are handled by TupletState
+            pass
+        if child.tag == "arpeggiate":
+            articulations.append("arpeggiate")
+        if child.tag == "tied":
+            tie_type = str(child.get("type", ""))
+            slurs.append("slur" + tie_type.capitalize())
+        if child.tag == "slur":
+            slur_type = str(child.get("type", ""))
+            slurs.append("slur" + slur_type.capitalize())
+
+    if part.tremolo:
+        articulations.append("tremolo")
+
+    articulations = list(set(articulations))
+    if len(articulations) == 0 and len(slurs) == 0:
+        return empty, empty
+
+    if len(articulations) == 0:
+        return empty, str.join("_", sorted(slurs))
+
+    if len(slurs) == 0:
+        return str.join("_", sorted(articulations)), empty
+
+    return str.join("_", sorted(articulations)), str.join("_", sorted(slurs))
+
+
+def _is_hidden_note(note: ET.Element) -> bool:
+    return note.get("print-object", None) == "no" or any(
+        _text(note_head) == "none" for note_head in _children(note, "notehead")
+    )
+
+
+def _find_main_voices(measure: ET.Element) -> dict[int, int]:
+    """
+    Find the main voice of each staff in a measure.
+    Main voice gets the position upper/lower, all others get upper2/lower2.
+
+    How to find the main voice?
+    The main voice is drawn with stems up and the others with stems down.
+    Usually that's the first visible voice, but engravers sometimes enter
+    the upper part in the second voice and flip the stems.
+    So if the first voice has mostly down stems and exactly one other
+    voice has mostly up stems, then that voice is the main voice.
+    We use stem_score to count the number of up stems and down stems.
+    """
+    # map staff index to voice index
+    first_voice: dict[int, int] = {}
+    # map (staff, voice) to its score
+    stem_score: dict[tuple[int, int], int] = defaultdict(int)
+    visible = [note for note in _children(measure, "note") if not _is_hidden_note(note)]
+    # A voice belongs to the staff with most of its notes. Notes of a cross-staff beam
+    # on the other staff don't make it the main voice there.
+    notes_per_staff: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for note in visible:
+        voice = _int_text(_child(note, "voice"), 0)
+        notes_per_staff[voice][_int_text(_child(note, "staff"), 1) - 1] += 1
+    home_staff = {
+        voice: max(counts, key=lambda staff: counts[staff])
+        for voice, counts in notes_per_staff.items()
+    }
+    for note in visible:
+        # in MusicXML, staff index starts at 1, but in our internal representation,
+        # it starts at 0 (the same as _process_note())
+        staff = _int_text(_child(note, "staff"), 1) - 1
+        voice = _int_text(_child(note, "voice"), 0)
+        if home_staff[voice] == staff:
+            first_voice.setdefault(staff, voice)
+        stem = _text(_child(note, "stem"))
+        if stem == "up":
+            stem_score[(staff, voice)] += 1
+        elif stem == "down":
+            stem_score[(staff, voice)] -= 1
+
+    for note in visible:
+        # A staff with only notes of voices from the other staff
+        first_voice.setdefault(
+            _int_text(_child(note, "staff"), 1) - 1, _int_text(_child(note, "voice"), 0)
+        )
+    result: dict[int, int] = {}
+    for staff, voice in first_voice.items():
+        if stem_score[(staff, voice)] < 0:
+            # first voice isn't the main voice, look for another one
+            alternatives = [
+                v
+                for (s, v), score in stem_score.items()
+                if s == staff and score > 0 and home_staff[v] == staff
+            ]
+            if len(alternatives) == 1:
+                result[staff] = alternatives[0]
+                continue
+        result[staff] = voice
+    return result
+
+
+def _process_note(part: TokensPart, note: ET.Element) -> None:
+    staff = 0
+    staff_nodes = _children(note, "staff")
+    # A note without a notehead isn't printed, but it takes time like an invisible one
+    invisible = _is_hidden_note(note)
+    if len(staff_nodes) > 0:
+        staff = _int_text(staff_nodes[0], 1) - 1
+    voice_nodes = _children(note, "voice")
+    voice = _int_text(voice_nodes[0], 0) if voice_nodes else 0
+    is_grace = _child(note, "grace") is not None
+    is_chord = _child(note, "chord") is not None
+    duration_node = _child(note, "duration")
+    if duration_node is None:
+        is_grace_note = _child(note, "grace") is not None
+        if not is_grace_note:
+            eprint("Note without duration", list(note))
+        duration = 0
+    else:
+        # Note: The duration in MusicXML is in the unit "divisions"
+        # divisions are specified in the parts attributes
+        duration = _int_text(duration_node)
+    triplet_factor = part.get_tuplet_factor(note, is_chord, duration)
+    rest = _children(note, "rest")
+    dots = _count_dots(note)
+    dur_nodes = _children(note, "type")
+    duration_type = _text(dur_nodes[0]) if dur_nodes else "eighth"
+    base_duration = round(DURATION_NUMBER[duration_type] * triplet_factor)
+    art, slur = _collect_articulation(note, part, staff)
+    if len(rest) > 0:
+        if rest[0] is not None and rest[0].get("measure", None):
+            rhythm = _measure_rest_rhythm(duration, part.divisions)
+            part.append_rest(
+                staff,
+                voice,
+                is_chord,
+                duration,
+                invisible,
+                EncodedSymbol(rhythm, empty, empty, empty, empty),
+            )
+        else:
+            rhythm = _rhythm_token("rest", base_duration, dots, is_grace)
+            sym = EncodedSymbol(rhythm, empty, empty, art, slur)
+            part.append_rest(staff, voice, is_chord, duration, invisible, sym)
+    pitch = _children(note, "pitch")
+    if len(pitch) > 0:
+        pitch_name = _pitch_name(pitch[0])
+        lift = _lift_from_pitch_or_accidental(pitch[0], note)
+        rhythm = _rhythm_token("note", base_duration, dots, is_grace)
+        sym = EncodedSymbol(rhythm, pitch_name, lift, art, slur)
+
+        # Grace notes have no duration and take no time
+        duration = 0 if is_grace else max(duration, 1)
+        part.append_note(staff, voice, is_chord, duration, invisible, sym)
+
+
+def _process_backup(part: TokensPart, backup: ET.Element) -> None:
+    backup_value = _int_text(_child(backup, "duration"))
+    part.append_position_change(-backup_value)
+
+
+def _process_forward(part: TokensPart, forward: ET.Element) -> None:
+    forward_value = _int_text(_child(forward, "duration"))
+    part.append_position_change(forward_value)
+
+
+def _process_barline(part: TokensPart, barline: ET.Element) -> None:
+    bar_style = ""  # style: light-heavy, light-light, "heave-heavy"
+    bar_style_nodes = _children(barline, "bar-style")
+    if len(bar_style_nodes) > 0:
+        bar_style = _text(bar_style_nodes[0])
+
+    direction = ""
+    repeat_nodes = _children(barline, "repeat")
+    if len(repeat_nodes) > 0:
+        direction = repeat_nodes[0].get("direction", "")
+
+    ending = ""
+    ending_nodes = _children(barline, "ending")
+    if len(ending_nodes) > 0:
+        ending = ending_nodes[0].get("type", "")
+
+    if direction == "forward":
+        part.append_symbol(EncodedSymbol("repeatStart"))
+    elif direction == "backward":
+        part.append_symbol(EncodedSymbol("repeatEnd"))
+    elif "heavy" in bar_style:
+        part.append_symbol(EncodedSymbol("bolddoublebarline"))
+    elif "light" in bar_style:
+        part.append_symbol(EncodedSymbol("doublebarline"))
+    else:
+        # "barline" elments without style or repeat are automatically added with measures
+        pass
+
+    if ending == "stop":
+        part.append_symbol(EncodedSymbol("voltaStop"))
+    elif ending == "discontinue":
+        part.append_symbol(EncodedSymbol("voltaDiscontinue"))
+    elif ending == "start":
+        part.append_symbol(EncodedSymbol("voltaStart"))
+
+
+def _process_print(part: TokensPart, xmlprint: ET.Element) -> None:
+    new_page = xmlprint.get("new-page", "")
+    if new_page == "yes":
+        part.mark_new_page()
+
+
+def _process_direction(part: TokensPart, xmldirection: ET.Element) -> None:
+    # Get the number of the staff the dynamic is on
+    staff = _int_text(_child(xmldirection, "staff"), 1) - 1
+    for direction_type in _children(xmldirection, "direction-type"):
+        has_octave_shift = _child(direction_type, "octave-shift") is not None
+        if has_octave_shift and not part.allow_octave_shifts:
+            raise ValueError("Octave shift isn't supported")
+        for dynamics in _children(direction_type, "dynamics"):
+            print_object = dynamics.get("print-object", None)
+            invisible = print_object == "no"
+            if invisible:
+                continue
+
+            modifier = (
+                "_".join(
+                    _text(child).replace(" ", "")
+                    for child in dynamics
+                    if child.tag == "other-dynamics"
+                )
+                .replace(".", "")
+                .replace("ù", "u")
+            )
+            modifier_symbol = f"dynamic_{modifier}" if modifier in DYNAMICS_MODIFIER else empty
+
+            # Check if it has a tag like p or ff
+            has_normal_tag = any(child.tag in DYNAMICS for child in dynamics)
+
+            for dyn in dynamics:
+                if dyn.tag in DYNAMICS:
+                    name = f"dynamic_{dyn.tag}"
+
+                elif not has_normal_tag and modifier in DYNAMICS_MODIFIER:
+                    name = "dynamic_empty"
+                else:
+                    continue
+                part.append_dynamic(
+                    EncodedSymbol(name, empty, empty, modifier_symbol, empty),
+                    staff,
+                )
+
+
+def _process_multi_rests(part: TokensPart, measure_style: ET.Element) -> int:
+    rests = _children(measure_style, "multiple-rest")
+    if len(rests) == 0:
+        return 0
+    rest = rests[0]
+    rest_duration = _int_text(rest)
+    # MusicXML represents a multi-measure rest as N ordinary <measure>s. MuseScore
+    # renders it as one measure, so the following N - 1 XML measures must be omitted
+    # by the caller to keep token and SVG measure counts aligned.
+    if rest_duration > 1:
+        part.append_symbol(
+            EncodedSymbol(f"rest_{min(rest_duration, 10)}m", empty, empty, empty, empty, "upper")
+        )
+    return rest_duration
+
+
+def _music_part_to_tokens(part: ET.Element, allow_octave_shifts: bool) -> list[Measure]:
+    tokens = TokensPart(allow_octave_shifts)
+    measures_to_skip = 0
+    for measure in _children(part, "measure"):
+        if measures_to_skip > 0:
+            # The final hidden measure can carry the rendered right barline.
+            if measures_to_skip == 1:
+                for child in list(measure):
+                    if child.tag == "barline":
+                        _process_barline(tokens, child)
+            measures_to_skip -= 1
+            continue
+        tokens.set_main_voices(_find_main_voices(measure))
+        multiple_rest_duration = 0
+        for child in list(measure):
+            if child.tag == "attributes":
+                multiple_rest_duration = _process_attributes(tokens, child)
+            # The first collapsed measure contains a placeholder whole rest in
+            # MusicXML. Its duration is represented by the multi-rest token.
+            if child.tag == "note" and multiple_rest_duration <= 1:
+                _process_note(tokens, child)
+            if child.tag == "backup" and multiple_rest_duration <= 1:
+                _process_backup(tokens, child)
+            if child.tag == "forward" and multiple_rest_duration <= 1:
+                _process_forward(tokens, child)
+            if child.tag == "barline":
+                _process_barline(tokens, child)
+            if child.tag == "print":
+                _process_print(tokens, child)
+            if child.tag == "direction":
+                _process_direction(tokens, child)
+        tokens.on_end_of_measure()
+        measures_to_skip = max(multiple_rest_duration - 1, 0)
+    return tokens.get_measures()
+
+
+def normalize_barlines_and_repeats(
+    measures: Sequence[Sequence[EncodedSymbol]],
+) -> list[EncodedSymbol]:
+    """Combine shared measure boundaries and return a flat transcription.
+
+    Pass consecutive measures from one part, selected for one image or a whole
+    part comparison. Source measures already include their ending barlines.
+    An ending barline and the next measure's opening repeat describe the same
+    boundary: keep the repeat, combining repeatEnd + repeatStart as repeatEndStart.
+
+    Keep symbols within each measure separate, even if no visible notes lie
+    between them. Do not modify the source measures or merge across images.
+    """
+    result: list[EncodedSymbol] = []
+    for index, measure in enumerate(measures):
+        if index > 0 and measures[index - 1] and measure and measure[0].rhythm == "repeatStart":
+            ending = measures[index - 1][-1].rhythm
+            if ending in ("repeatEnd", "repeatEndStart"):
+                result[-1] = EncodedSymbol("repeatEndStart")
+                result.extend(measure[1:])
+                continue
+            if "barline" in ending:
+                result.pop()
+        result.extend(measure)
+    return result
+
+
+def _music_xml_element_to_symbols(
+    root: ET.Element, allow_octave_shifts: bool
+) -> list[list[Measure]]:
+    # Support both <score-partwise> as the root and as a wrapped document.
+    score_root = root
+    result: list[list[Measure]] = []
+    for part in _children(score_root, "part"):
+        tokens = _music_part_to_tokens(part, allow_octave_shifts)
+        result.append(tokens)
+    return result
+
+
+def music_xml_string_to_tokens(
+    content: str, allow_octave_shifts: bool = False
+) -> list[list[Measure]]:
+    """
+    Returns a list of voices.
+    Each voice is a list of measures.
+    """
+    xml = ET.fromstring(content)  # noqa: S314
+    return _music_xml_element_to_symbols(xml, allow_octave_shifts)
+
+
+def music_xml_file_to_tokens(
+    file_path: str, allow_octave_shifts: bool = False
+) -> list[list[Measure]]:
+    with open(file_path, "rb") as f:
+        xml = ET.parse(f)  # noqa: S314
+    return _music_xml_element_to_symbols(xml.getroot(), allow_octave_shifts)
+
+
+if __name__ == "__main__":
+    import glob
+    import multiprocessing
+    import os
+    import sys
+
+    from homr.simple_logging import eprint
+
+    if len(sys.argv) > 1:
+        result = music_xml_file_to_tokens(sys.argv[1])
+        for line in result:
+            eprint(line)
+        sys.exit(0)
+
+    stats = VocabularyStats()
+    files = glob.glob(
+        os.path.join("datasets", "Lieder-main", "**", "**.musicxml"),
+        recursive=True,
+    )
+
+    def process_file(file: str) -> tuple[str, list[Measure], Exception | None]:
+        try:
+            voices = music_xml_file_to_tokens(file)
+            tokens_list = []
+            for staffs in voices:
+                for tokens in staffs:
+                    tokens_list.append(tokens)
+            return (file, tokens_list, None)
+        except Exception as e:
+            return (file, [], e)
+
+    errors = set()
+
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+        for file, tokens_list, err in pool.imap_unordered(process_file, sorted(files)):
+            if err:
+                eprint("Error while processing", file, err)
+            else:
+                eprint("Finished", file)
+                for tokens in tokens_list:
+                    stats.add_lines(tokens)
+                    try:
+                        check_token_lines(tokens)
+                    except Exception as e:
+                        errors.add(str(e))
+                        eprint(e)
+    eprint("Stats", stats)
+    if len(errors) > 0:
+        eprint("There have been errors", errors)
+        sys.exit(1)

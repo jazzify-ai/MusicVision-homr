@@ -29,7 +29,7 @@ jobs:
 
       - name: Install poetry
         run: |
-          python -m pip install poetry==1.8.5
+          python -m pip install poetry==2.4.1  # matches poetry.lock (PEP 621 pyproject)
           poetry self add "poetry-dynamic-versioning[plugin]"
 
       - name: Install dependencies

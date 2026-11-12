@@ -8,8 +8,8 @@ import numpy as np
 from homr.download_utils import download_file, untar_file
 from homr.simple_logging import eprint
 from homr.type_definitions import NDArray
-from training.datasets.humdrum_kern_parser import convert_kern_to_tokens
-from training.datasets.musescore_svg import SvgValidationError
+from training.omr_datasets.humdrum_kern_parser import convert_kern_to_tokens
+from training.omr_datasets.musescore_svg import SvgValidationError
 from training.transformer.training_vocabulary import (
     calc_ratio_of_tuplets,
     token_lines_to_str,
@@ -120,6 +120,9 @@ def _convert_tokens_and_image(path: Path) -> tuple[Path, str]:
 
 
 def _filter_out_known_bad_ones(path: Path) -> bool:
+    if path.name.startswith("._"):
+        return False
+
     # These images contain to meaningful data or have
     # artifacts like large black areas
     bad_files = {
@@ -139,6 +142,42 @@ def _filter_out_known_bad_ones(path: Path) -> bool:
     return normalized not in bad_files
 
 
+def remove_problematic_files(result: str) -> bool:
+    # The model was too eager to predict slurStart. The grandstaff dataset contains around
+    # 12% more slurStart than slurStop (38k vs 34k). Therefore we remove all files from
+    # the index that have more slurStart than slurStop.
+    # Skips around 4100 files in adition to already skipped files
+    if result == "":
+        return False
+
+    img_path, token_path = result.split(",")
+
+    if not img_path and not token_path:
+        return False
+
+    slur_starts = 0
+    slur_stops = 0
+
+    for line in Path(token_path).read_text(errors="ignore").splitlines():
+        for entry in line.split("&"):
+            parts = entry.strip().split()
+            if len(parts) < 5:
+                eprint(f"Only {len(parts)} tokens instead of 6 expected")
+                continue
+
+            slur = parts[4]
+
+            if "slurStart" in slur:
+                slur_starts += 1
+            if "slurStop" in slur:
+                slur_stops += 1
+
+    if slur_starts == slur_stops:
+        return True
+    else:
+        return False
+
+
 def convert_grandstaff(only_recreate_token_files: bool = False) -> None:
     if not os.path.exists(grandstaff_root):
         eprint(
@@ -149,15 +188,11 @@ def convert_grandstaff(only_recreate_token_files: bool = False) -> None:
         untar_file(grandstaff_archive, grandstaff_root)
         eprint("Adding musicxml files to grandstaff dataset")
 
-    index_file = grandstaff_train_index
-    if only_recreate_token_files:
-        index_file = os.path.join(grandstaff_root, "index_tmp.txt")
-
     eprint("Indexing Grandstaff dataset, this can up to several hours.")
     krn_files = list(Path(grandstaff_root).rglob("*.krn"))
     krn_files = [file for file in krn_files if _filter_out_known_bad_ones(file)]
     skipped: set[Path] = set()
-    with open(index_file, "w") as f:
+    with open(grandstaff_train_index, "w") as f:
         file_number = 0
         with multiprocessing.Pool() as p:
             for file, result in p.imap_unordered(
@@ -168,7 +203,7 @@ def convert_grandstaff(only_recreate_token_files: bool = False) -> None:
                 ),
                 krn_files,
             ):
-                if result != "":
+                if result != "" and remove_problematic_files(result):
                     f.write(result + "\n")
                     file_number += 1
                     if file_number % 1000 == 0:

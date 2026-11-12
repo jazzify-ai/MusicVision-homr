@@ -10,7 +10,7 @@ root_dir = os.getcwd()
 
 class FilePaths:
     def __init__(self) -> None:
-        model_name = "pytorch_model_331-e10346542968cc71fbcce0c0696f3ac963f11ae1"
+        model_name = "pytorch_model_509-2293bba14bfea47d9d28411339362af15fce4c31"
         self.encoder_path = os.path.join(
             workspace,
             f"encoder_{model_name}.onnx",
@@ -99,6 +99,7 @@ class Config:
         self.num_pitch_tokens = len(self.vocab.pitch)
         self.num_lift_tokens = len(self.vocab.lift)
         self.num_articulation_tokens = len(self.vocab.articulation)
+        self.num_slur_tokens = len(self.vocab.slur)
         self.num_position_tokens = len(self.vocab.position)
         self.encoder_structure = "convnext"
         self.encoder_depth = 8
@@ -116,13 +117,19 @@ class Config:
         self.pitch_vocab = self.vocab.pitch
         self.rhythm_vocab = self.vocab.rhythm
         self.articulation_vocab = self.vocab.articulation
+        self.slur_vocab = self.vocab.slur
         self.position_vocab = self.vocab.position
         self.use_gpu_inference = True
+        # Opt-in: run the encoder on the Apple GPU via CoreML (MLProgram). Off
+        # by default because compiling the MLProgram costs 26-60 s at session
+        # creation, so it only pays off across many images. Set via the
+        # --coreml-encoder CLI flag.
+        self.use_coreml_encoder = False
 
         # Scheduled Sampling parameters
         self.scheduled_sampling_start_prob = 1.0
-        self.scheduled_sampling_end_prob = 0.7
-        self.scheduled_sampling_decay_steps = 20000
+        self.scheduled_sampling_end_prob = 0.4
+        self.scheduled_sampling_decay_steps = 45000
 
     def to_dict(self) -> dict[str, Any]:
         return {

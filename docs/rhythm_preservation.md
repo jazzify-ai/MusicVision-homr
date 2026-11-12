@@ -1,3 +1,11 @@
+> **Superseded (2026-11-12).** This fork now runs upstream HOMR at commit `dbd17e23` with model
+> run 509, and uses upstream's MusicXML exporter, which already writes ties (same-pitch slurs
+> become `<tie>` + `<tied>`) and tuplet brackets. Short-bar handling moved to the Jazzify
+> bar-length beam search (`homr/jazzify/`). The regression tests in
+> `tests/test_rhythm_preservation.py` were kept and adapted; two bracket edge cases that
+> upstream's exporter handles differently are marked `xfail`. The original text follows for
+> history.
+
 # Rhythm preservation before model training
 
 The November 2026 investigation separated decoder misses from symbols lost after
