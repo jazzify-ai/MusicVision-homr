@@ -574,12 +574,12 @@ def _make_generate(options: DecodeOptions, page: _PageState, evidence: dict):
             self._mv_vocab = vocab
         context_full = kwargs["context"]
         context_reduced = context_full[:, :1]
-        _, kv_in, kv_out = self.init_cache()
-        heads_dim = self.config.decoder_dim // self.config.decoder_heads
-        dtype = np.float16 if self.fp16 else np.float32
-        empty_cache = [
-            np.zeros((1, self.config.decoder_heads, 0, heads_dim), dtype=dtype) for _ in kv_in
-        ]
+        # init_cache() allocates the empty cache on the session's device (GPU when CUDA is
+        # active). Every hypothesis keeps its cache there as OrtValues and passes it back in
+        # through io_binding, so the cache never travels to host memory between steps. Only
+        # the small per-step outputs (logits, attention) are copied back.
+        empty_cache, kv_in, kv_out = self.init_cache()
+        output_names = self.output_names + kv_out
         start = int(np.asarray(start_tokens).reshape(-1)[0])
         nonote = int(np.asarray(nonote_tokens).reshape(-1)[0])
         prefix_ids = [vocab.rhythm[t] for t in page.prefix or [] if t in vocab.rhythm]
@@ -608,27 +608,41 @@ def _make_generate(options: DecodeOptions, page: _PageState, evidence: dict):
                     expanded.append(hyp)
                     continue
                 r, p, lf, a, sl = hyp.last
-                feed = {
+                # Keep the host arrays referenced until the run returns.
+                host_inputs = {
                     "rhythms": np.array([[r]], dtype=np.int64),
                     "pitchs": np.array([[p]], dtype=np.int64),
                     "lifts": np.array([[lf]], dtype=np.int64),
                     "articulations": np.array([[a]], dtype=np.int64),
                     "slurs": np.array([[sl]], dtype=np.int64),
-                    "context": context_full if step == 0 else context_reduced,
+                    "context": np.ascontiguousarray(
+                        context_full if step == 0 else context_reduced
+                    ),
                     "cache_len": np.array([step], dtype=np.int64),
                 }
-                feed.update(dict(zip(kv_in, hyp.cache, strict=True)))
-                outputs = self.net.run(self.output_names + kv_out, feed)
+                # A fresh binding per run is required: reusing self.io_binding lets ORT write a
+                # later run's outputs into buffers that sibling hypotheses still hold as their
+                # cache, which silently changed the decoded music.
+                binding = self.net.io_binding()
+                for name, value in host_inputs.items():
+                    binding.bind_cpu_input(name, value)
+                for name, value in zip(kv_in, hyp.cache, strict=True):
+                    binding.bind_ortvalue_input(name, value)
+                for name in output_names:
+                    binding.bind_output(name, self.device, self.device_id)
+                self.net.run_with_iobinding(iobinding=binding)
+                outputs = binding.get_outputs()
                 cache = outputs[7:]
+                logits = [outputs[i].numpy() for i in range(6)]
                 heads = {
-                    "rhythm": log_softmax(outputs[0][0, -1].astype(np.float64)),
-                    "pitch": log_softmax(outputs[1][0, -1].astype(np.float64)),
-                    "lift": log_softmax(outputs[2][0, -1].astype(np.float64)),
-                    "position": log_softmax(outputs[3][0, -1].astype(np.float64)),
-                    "articulation": log_softmax(outputs[4][0, -1].astype(np.float64)),
-                    "slur": log_softmax(outputs[5][0, -1].astype(np.float64)),
+                    "rhythm": log_softmax(logits[0][0, -1].astype(np.float64)),
+                    "pitch": log_softmax(logits[1][0, -1].astype(np.float64)),
+                    "lift": log_softmax(logits[2][0, -1].astype(np.float64)),
+                    "position": log_softmax(logits[3][0, -1].astype(np.float64)),
+                    "articulation": log_softmax(logits[4][0, -1].astype(np.float64)),
+                    "slur": log_softmax(logits[5][0, -1].astype(np.float64)),
                 }
-                attention = outputs[6]
+                attention = outputs[6].numpy()
                 top = heads["rhythm"].argsort()[::-1][:4]
                 alts = [
                     [vocab.inv_rhythm[int(i)], round(float(heads["rhythm"][i]), 2)] for i in top
