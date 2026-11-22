@@ -119,6 +119,13 @@ def _calculate_region(staff: Staff, regions: StaffRegions) -> NDArray:
         staff.max_y + 4 * staff.average_unit_size,
         regions.get_start_of_closest_staff_below(staff.max_y),
     )
+    if y_min > staff.min_y or y_max < staff.max_y:
+        # A neighbour limit cutting into the staff itself means overlapping staff detections.
+        # They can even cross, which gave a negative canvas height and an OpenCV resize error
+        # that failed the whole page (9 production uploads, 2026-11-22). Fall back to the
+        # staff's own bounds with a small margin.
+        y_min = staff.min_y - staff.average_unit_size
+        y_max = staff.max_y + staff.average_unit_size
     return np.array([int(x_min), int(y_min), int(x_max), int(y_max)])
 
 

@@ -54,3 +54,29 @@ class TestStaffRegions(unittest.TestCase):
         self.assertEqual(100, regions.get_start_of_closest_staff_below(99))
         self.assertEqual(700, regions.get_start_of_closest_staff_below(600))
         self.assertEqual(1e12, regions.get_start_of_closest_staff_below(800))
+
+
+class TestCalculateRegion(unittest.TestCase):
+    def test_overlapping_staffs_keep_a_positive_region(self) -> None:
+        # A second detection overlapping the staff makes the neighbour limits cross; the region
+        # used to come out upside down and crash the canvas resize for the whole page.
+        from homr.staff_parsing import _calculate_region
+
+        staff = build_staff(300, 400)
+        overlapping = build_staff(250, 350)
+        regions = StaffRegions([MultiStaff([staff], []), MultiStaff([overlapping], [])])
+        x_min, y_min, x_max, y_max = _calculate_region(staff, regions)
+        self.assertGreater(y_max - y_min, 100)
+        self.assertLessEqual(y_min, 300)
+        self.assertGreaterEqual(y_max, 400)
+
+    def test_separate_staffs_use_neighbour_limits(self) -> None:
+        from homr.staff_parsing import _calculate_region
+
+        staff = build_staff(300, 400)
+        regions = StaffRegions(
+            [MultiStaff([build_staff(100, 200)], []), MultiStaff([staff], []),
+             MultiStaff([build_staff(500, 600)], [])]
+        )
+        _, y_min, _, y_max = _calculate_region(staff, regions)
+        self.assertEqual((y_min, y_max), (200, 500))
