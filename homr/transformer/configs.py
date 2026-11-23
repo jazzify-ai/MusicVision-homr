@@ -10,7 +10,10 @@ root_dir = os.getcwd()
 
 class FilePaths:
     def __init__(self) -> None:
-        model_name = "pytorch_model_509-2293bba14bfea47d9d28411339362af15fce4c31"
+        # Jazzify: the deployment may select a fine-tuned model whose ONNX files it ships itself.
+        model_name = os.getenv(
+            "HOMR_TRANSFORMER_MODEL", "pytorch_model_509-2293bba14bfea47d9d28411339362af15fce4c31"
+        ).strip()
         self.encoder_path = os.path.join(
             workspace,
             f"encoder_{model_name}.onnx",

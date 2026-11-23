@@ -79,6 +79,9 @@ class DecodeOptions:
     meter_change_penalty: float = 1.0
     ornament_min_prob: float | None = None
     cleanup: bool = False
+    # Put the carried clef/key *image strip* in front of lines that print neither, so notes are
+    # read with the key signature in view (homr/jazzify/clef_key_strip.py).
+    paste_clef_key: bool = False
     # Run the re-implemented decoder in pure upstream mode, to prove token-for-token parity.
     parity_check: bool = False
 
@@ -87,6 +90,7 @@ class DecodeOptions:
         return (
             self.parity_check
             or self.carry_clef_key
+            or self.paste_clef_key
             or self.consistent_heads
             or self.beam_width > 1
             or self.ornament_min_prob is not None
@@ -545,6 +549,9 @@ class _PageState:
         self.meter_seen = False
         self.staffs: list[dict] = []
         self.encoder_cache: dict[str, Any] = {}
+        self.strip: Any = None  # ClefKeyStrip of the last line that printed clef + key
+        self.paste_now = False
+        self.last_canvas: Any = None
 
 
 CURRENT: _PageState | None = None
@@ -815,13 +822,17 @@ def decoding_experiment(hm, options: DecodeOptions, carry: dict | None = None) -
     if not options.enabled:
         yield evidence
         return
+    import numpy as np
+
     from homr import staff_parsing
+    from homr.jazzify.clef_key_strip import extract_strip, paste_strip, staff_lines
     from homr.jazzify.refinement import _leading_clef_key_anchor
     from homr.transformer import decoder_inference, encoder_inference
 
     page = _PageState()
     if carry is not None and carry.get("clef_key"):
         page.carried = list(carry["clef_key"])
+        page.strip = carry.get("clef_key_strip")
     evidence["carried_in"] = list(page.carried) if page.carried else None
     CURRENT = page
     originals: list[tuple[Any, str, Any]] = []
@@ -856,6 +867,50 @@ def decoding_experiment(hm, options: DecodeOptions, carry: dict | None = None) -
 
         replace(encoder_inference.Encoder, "generate", cached_encode)
 
+    # staff_parsing imports the function by name, so the hook replaces that module-level name.
+    parse_staff_tromr = vars(staff_parsing)["parse_staff_tromr"]
+
+    def tromr_hook(*args, **kwargs):
+        staff_image = kwargs["staff_image"]
+        page.last_canvas = staff_image
+        if page.paste_now and page.strip is not None:
+            pasted = paste_strip(staff_image, page.strip)
+            if pasted is not None:
+                image, to_original = pasted
+                result = parse_staff_tromr(*args, **{**kwargs, "staff_image": image})
+                for symbol in result:
+                    if symbol.coordinates is None:
+                        continue
+                    point = np.asarray(symbol.coordinates, dtype=np.float64)
+                    flat = point.reshape(-1)
+                    if len(flat) >= 2 and not np.isnan(flat[:2]).any():
+                        flat[0], flat[1] = to_original(float(flat[0]), float(flat[1]))
+                        symbol.coordinates = flat.reshape(point.shape)
+                page.staffs[-1]["pasted_clef_key"] = True
+                return result
+        return parse_staff_tromr(*args, **kwargs)
+
+    if options.paste_clef_key:
+        replace(staff_parsing, "parse_staff_tromr", tromr_hook)
+
+    def strip_end(result) -> float | None:
+        """x where the key signature ends: just before the next symbol after it."""
+        lines = staff_lines(page.last_canvas) if page.last_canvas is not None else None
+        if lines is None:
+            return None
+        unit = float(np.diff(lines).mean())
+        seen_key = False
+        for symbol in result:
+            if symbol.rhythm.startswith("keySignature"):
+                seen_key = True
+                continue
+            if seen_key and symbol.coordinates is not None:
+                x = float(np.asarray(symbol.coordinates, dtype=np.float64).reshape(-1)[0])
+                if not np.isnan(x):
+                    # The attention centre sits mid-glyph; a time signature is ~2 units wide.
+                    return x - 1.5 * unit
+        return None
+
     parse_staff_image = staff_parsing.parse_staff_image
 
     def staff_hook(debug, index, staff, image, regions, config, *rest, **kwargs):
@@ -874,6 +929,16 @@ def decoding_experiment(hm, options: DecodeOptions, carry: dict | None = None) -
             page.prefix = [options.default_clef]
         else:
             page.prefix = None
+        # Only a carried key with flats/sharps is worth pasting: a clef alone is already handled by
+        # the forced prefix, and Omnibook lines whose own cramped clef the anchor check misses got
+        # a second clef in front (-23 bars on Omnibook val, 2026-11-22).
+        page.paste_now = bool(
+            options.paste_clef_key
+            and may_force
+            and page.carried is not None
+            and page.carried[1] != "keySignature_0"
+            and page.strip
+        )
         record = {
             "staff_index": index,
             "leading_clef_key_anchor": has_anchor,
@@ -926,9 +991,17 @@ def decoding_experiment(hm, options: DecodeOptions, carry: dict | None = None) -
         if options.carry_clef_key and has_anchor:
             if clef and key and clef in options.trusted_clefs:
                 page.carried = [clef, key]
+                if options.paste_clef_key and page.last_canvas is not None:
+                    end = strip_end(result)
+                    strip = extract_strip(page.last_canvas, end) if end is not None else None
+                    if strip is not None:
+                        page.strip = strip
+                    record["strip_saved"] = strip is not None
                 if carry is not None:
                     carry["clef_key"] = list(page.carried)
+                    carry["clef_key_strip"] = page.strip
         page.prefix = None
+        page.paste_now = False
         return result
 
     replace(staff_parsing, "parse_staff_image", staff_hook)

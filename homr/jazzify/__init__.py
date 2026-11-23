@@ -12,6 +12,10 @@ What is enabled (letters as in MusicVision-ml-private ``docs/homr_decoding_exper
   soft penalty for bars that do not add up to the page's reference bar length.
 - E: orphan slur stop -> tie, low-confidence ornaments dropped, repeated/odd time signatures
   normalised, and beams written into the MusicXML.
+- Clef/key strip: on an unmarked line under a carried key with flats or sharps, the printed
+  clef + key-signature image of the last marked line is pasted in front of the line, so notes are
+  read with the key in view ('Round Midnight 14 -> 18/18 with run 12, 2026-11-22). Polish scores
+  and sheet-music photos: no page changes by more than 2 points (2026-11-23).
 - Displayed accidentals (``homr.accidentals``).
 
 Measured before porting (2026-11-12): Airegin 37/38 exact bars (from 29 on run 331),
@@ -41,6 +45,7 @@ PRODUCTION_OPTIONS = DecodeOptions(
     meter_change_penalty=1.0,
     ornament_min_prob=0.75,
     cleanup=True,
+    paste_clef_key=True,
 )
 
 
