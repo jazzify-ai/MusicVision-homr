@@ -2,9 +2,12 @@
 
 What is enabled (letters as in MusicVision-ml-private ``docs/homr_decoding_experiments.md``):
 
-- Tuplet preservation: upstream's two tuplet heuristics (``_fix_over_eager_tuplets``,
-  ``restore_unmarked_triplets``) are disabled; the bar-length beam search below handles short
-  bars instead.
+- Tuplets: upstream's two tuplet heuristics (``_fix_over_eager_tuplets``,
+  ``restore_unmarked_triplets``) stay on. Disabling them ("tuplet preservation", used until
+  2026-11-25) cost piano and old scans: with run 12, Polish scores 15.01% with them vs 16.25%
+  without (pages 1, 3, 20, 25, 37, 88 lost 9-27 points), while Airegin 38/38, 'Round Midnight
+  18/18, Omnibook validation 585 vs 584 of 674 exact bars and sheet-music photos (5.69% vs
+  5.71%) were unchanged or better.
 - Title filter: a leading staff-like title decoration with no notes, clef or barlines is dropped.
 - B: the clef/key read on the last staff that printed them is forced on unmarked staffs
   (lead sheets print them on the first line only); misread printed clefs are re-decoded.
@@ -68,7 +71,7 @@ def jazzify_processing(
         return
     options = options or PRODUCTION_OPTIONS
     with (
-        upstream_experiment(main_module, preserve_tuplets=True, filter_header=True) as refinement,
+        upstream_experiment(main_module, preserve_tuplets=False, filter_header=True) as refinement,
         decoding_experiment(main_module, options, carry) as decoding,
     ):
         yield {"refinement": refinement, "decoding": decoding}
